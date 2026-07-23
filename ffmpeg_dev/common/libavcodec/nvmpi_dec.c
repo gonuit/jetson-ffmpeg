@@ -24,12 +24,15 @@
 #define OPT_frame_pool_size_DEFAULT 5
 
 typedef struct {
-	char eos_reached;
-	nvmpictx* ctx;
+	//the AVClass pointer must be the first member: libavcodec writes
+	//codec->priv_class to the start of priv_data (the old layout with
+	//eos_reached first got silently clobbered by that pointer)
 	AVClass *av_class;
+	nvmpictx* ctx;
 	AVFrame *bufFrame;
 	char *resize_expr;
 	int frame_pool_size;
+	char eos_reached;
 } nvmpiDecodeContext;
 
 static nvCodingType nvmpi_get_codingtype(AVCodecContext *avctx)
