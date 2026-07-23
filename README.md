@@ -122,10 +122,14 @@ last — so `-resize 1280x720 -rotate 90` produces a 720x1280 output.
 **Zero-copy encoder input from Vulkan / DRM PRIME (ffmpeg 8+, API)**
 
 The encoders accept `AV_PIX_FMT_DRM_PRIME` frames and queue the dmabuf
-directly on the V4L2 output plane. Vulkan: linear NV12 image
+directly on the V4L2 output plane. Vulkan: linear NV12 or P010 image
 (`tiling = VK_IMAGE_TILING_LINEAR` on the frames context), mapped per frame
 with `av_hwframe_map()` to drm_prime; non-ffmpeg users:
-`nvmpi_encoder_put_dmabuf()`. Constraints: 8-bit NV12, single dmabuf object,
-pitch-linear with 256-aligned pitch (Tegra linear pitch == width), descriptor
-must carry the plane layout. Keep a frame's dmabuf untouched until its buffer
-slot recycles (the ffmpeg wrapper holds frame refs that long).
+`nvmpi_encoder_put_dmabuf()`. Constraints: NV12, or P010 for hevc_nvmpi
+(HEVC Main 10); single dmabuf object, pitch-linear with 256-aligned byte
+pitch (Tegra linear pitch == width for NV12, width*2 for P010), descriptor
+must carry the plane layout. Map each Vulkan image once and reuse the mapped
+frame (every `av_hwframe_map()` exports a new fd and forces a re-import), and
+keep at least `num_capture_buffers + 2` images in the producer pool: a queued
+dmabuf is read only when the encoder blits it, so rewriting a buffer that is
+still in the V4L2 queue corrupts the stream.

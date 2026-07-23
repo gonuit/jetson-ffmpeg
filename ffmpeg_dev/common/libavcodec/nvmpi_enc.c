@@ -73,6 +73,7 @@ typedef struct {
 	AVFrame *frame; //tmp frame
 	//drm_prime input: refs held while frames sit queued in V4L2
 	int hw_input;
+	enum AVPixelFormat hw_sw_format;
 	AVFrame **held_frames;
 	int held_count;
 	int held_pos;
@@ -243,18 +244,23 @@ static av_cold int nvmpi_encode_init(AVCodecContext *avctx)
 	nvmpi_context->hw_input = (avctx->pix_fmt == AV_PIX_FMT_DRM_PRIME);
 	if(nvmpi_context->hw_input)
 	{
+		nvmpi_context->hw_sw_format = AV_PIX_FMT_NV12;
 		if(avctx->hw_frames_ctx)
 		{
 			AVHWFramesContext *hwf = (AVHWFramesContext*)avctx->hw_frames_ctx->data;
-			if(hwf->sw_format != AV_PIX_FMT_NV12)
+			if(hwf->sw_format == AV_PIX_FMT_P010LE && avctx->codec->id == AV_CODEC_ID_HEVC)
+				nvmpi_context->hw_sw_format = AV_PIX_FMT_P010LE;
+			else if(hwf->sw_format != AV_PIX_FMT_NV12)
 			{
-				av_log(avctx, AV_LOG_ERROR, "drm_prime input must carry NV12, got %s\n",
+				av_log(avctx, AV_LOG_ERROR, "drm_prime input must carry NV12%s, got %s\n",
+					avctx->codec->id == AV_CODEC_ID_HEVC ? " or P010" : "",
 					av_get_pix_fmt_name(hwf->sw_format));
 				return AVERROR(EINVAL);
 			}
 		}
 		param.useDmabufInput = 1;
-		param.inputPixFormat = NV_PIX_NV12;
+		param.inputPixFormat = (nvmpi_context->hw_sw_format == AV_PIX_FMT_P010LE) ?
+			NV_PIX_P010 : NV_PIX_NV12;
 		//frames stay queued in V4L2 until their buffer slot recycles
 		nvmpi_context->held_count = nvmpi_context->num_capture_buffers + 2;
 		nvmpi_context->held_frames = av_calloc(nvmpi_context->held_count, sizeof(AVFrame*));
@@ -311,14 +317,21 @@ static av_cold int nvmpi_encode_init(AVCodecContext *avctx)
 		else if(avctx->codec->id == AV_CODEC_ID_AV1) param.codingType = NV_VIDEO_CodingAV1;
 		else param.codingType = NV_VIDEO_CodingHEVC;
 		//the pre-run feeds dummy CPU frames; with drm_prime input the
-		//throwaway encoder runs in CPU mode (extradata is identical)
+		//throwaway encoder runs in CPU mode at the same bit depth so the
+		//extradata (SPS profile) matches
 		enum AVPixelFormat dummyFmt = avctx->pix_fmt;
 		char savedDmabufInput = param.useDmabufInput;
+		nvPixFormat savedPixFormat = param.inputPixFormat;
 		if(nvmpi_context->hw_input)
 		{
-			dummyFmt = AV_PIX_FMT_YUV420P;
 			param.useDmabufInput = 0;
-			param.inputPixFormat = NV_PIX_YUV420;
+			if(param.inputPixFormat == NV_PIX_P010)
+				dummyFmt = AV_PIX_FMT_P010LE;
+			else
+			{
+				dummyFmt = AV_PIX_FMT_YUV420P;
+				param.inputPixFormat = NV_PIX_YUV420;
+			}
 		}
 		ret = av_image_alloc(dst, linesize,avctx->width,avctx->height,dummyFmt,1);
 		if(ret < 0)
@@ -449,7 +462,7 @@ static av_cold int nvmpi_encode_init(AVCodecContext *avctx)
 		if(nvmpi_context->hw_input)
 		{
 			param.useDmabufInput = savedDmabufInput;
-			param.inputPixFormat = NV_PIX_NV12;
+			param.inputPixFormat = savedPixFormat;
 		}
 	}
 
@@ -496,10 +509,11 @@ static int nvmpienc_send_drm_frame(AVCodecContext *avctx, const AVFrame *frame)
 	if(frame->hw_frames_ctx)
 	{
 		AVHWFramesContext *hwf = (AVHWFramesContext*)frame->hw_frames_ctx->data;
-		if(hwf->sw_format != AV_PIX_FMT_NV12)
+		if(hwf->sw_format != nvmpi_context->hw_sw_format)
 		{
-			av_log(avctx, AV_LOG_ERROR, "drm_prime input must carry NV12, got %s\n",
-				av_get_pix_fmt_name(hwf->sw_format));
+			av_log(avctx, AV_LOG_ERROR, "drm_prime frame carries %s, encoder was opened for %s\n",
+				av_get_pix_fmt_name(hwf->sw_format),
+				av_get_pix_fmt_name(nvmpi_context->hw_sw_format));
 			return AVERROR(EINVAL);
 		}
 	}
@@ -517,7 +531,7 @@ static int nvmpienc_send_drm_frame(AVCodecContext *avctx, const AVFrame *frame)
 		}
 	if(np != 2)
 	{
-		av_log(avctx, AV_LOG_ERROR, "drm_prime frame describes %d planes, expected 2 (NV12); "
+		av_log(avctx, AV_LOG_ERROR, "drm_prime frame describes %d planes, expected 2 (NV12/P010); "
 			"the producer did not export the plane layout\n", np);
 		return AVERROR(EINVAL);
 	}

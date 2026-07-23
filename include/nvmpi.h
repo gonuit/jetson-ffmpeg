@@ -73,12 +73,13 @@ typedef struct _NVENCPARAM{
 	//NV_PIX_P010 (10-bit, HEVC only -> Main 10). Appended last to keep field
 	//offsets of existing users stable; rebuild callers together with the lib.
 	nvPixFormat inputPixFormat;
-	//non-zero: raw frames arrive via nvmpi_encoder_put_dmabuf (8-bit NV12 only)
+	//non-zero: raw frames arrive via nvmpi_encoder_put_dmabuf. NV12, or P010
+	//when inputPixFormat is NV_PIX_P010 (HEVC Main 10 only)
 	char useDmabufInput;
 } nvEncParam;
 
-//external pitch-linear NV12 dmabuf (e.g. Vulkan export); all planes in one fd,
-//pitch must be a multiple of 256
+//external pitch-linear NV12/P010 dmabuf (e.g. Vulkan export); all planes in
+//one fd, pitch in bytes must be a multiple of 256
 typedef struct _NVDMABUFFRAME{
 	int fd;
 	unsigned long totalSize;
@@ -138,7 +139,10 @@ extern "C" {
 	int nvmpi_encoder_put_frame(nvmpictx* ctx, nvFrame* frame);
 	//zero-copy: queue an external dmabuf as the next raw frame (requires
 	//useDmabufInput). The fd must stay valid and untouched while its V4L2
-	//buffer is in flight. NULL flushes.
+	//buffer is in flight: the blit reads it only when the encoder reaches the
+	//buffer, so the producer pool must span the queue depth (capture_num + 2
+	//buffers). Reuse stable fds; a new fd for the same memory re-imports.
+	//NULL flushes.
 	int nvmpi_encoder_put_dmabuf(nvmpictx* ctx, nvDmaBufFrame* frame);
 	//get filled packet from encoder
 	int nvmpi_encoder_get_packet(nvmpictx* ctx, nvPacket** packet);

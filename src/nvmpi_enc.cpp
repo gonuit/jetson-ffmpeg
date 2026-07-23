@@ -71,6 +71,7 @@ struct nvmpictx
 	//fds registered via NvBufSurfaceImport: the V4L2 backend resolves queued
 	//fds with NvBufSurfaceFromFd, which only knows registered buffers
 	std::vector<int> importedFds;
+	NvBufSurfaceColorFormat dmabufColorFormat;
 #endif
 };
 
@@ -449,16 +450,24 @@ nvmpictx* nvmpi_create_encoder(nvEncParam* param)
 		ctx->raw_pixfmt = V4L2_PIX_FMT_P010M;
 	}
 
-	//zero-copy dmabuf input: raw frames are external NV12 surfaces queued by fd
+	//zero-copy dmabuf input: raw frames are external NV12/P010 surfaces queued by fd
 	if(param->useDmabufInput)
 	{
 #ifndef WITH_NVUTILS
 		ENC_CHECK(true, "dmabuf input requires the nvbufsurface API (JetPack 5+)");
-#endif
-		ENC_CHECK(ctx->raw_pixfmt == V4L2_PIX_FMT_P010M, "dmabuf input supports 8-bit NV12 only");
+#else
+		ENC_CHECK(param->inputPixFormat == NV_PIX_P010 && ctx->raw_pixfmt != V4L2_PIX_FMT_P010M,
+			"10-bit dmabuf input requires HEVC (Main 10)");
 		ENC_CHECK(ctx->enableLossless, "dmabuf input is incompatible with lossless YUV444");
 		ctx->dmabuf_input = true;
-		ctx->raw_pixfmt = V4L2_PIX_FMT_NV12M;
+		if(ctx->raw_pixfmt == V4L2_PIX_FMT_P010M)
+			ctx->dmabufColorFormat = NVBUF_COLOR_FORMAT_NV12_10LE;
+		else
+		{
+			ctx->raw_pixfmt = V4L2_PIX_FMT_NV12M;
+			ctx->dmabufColorFormat = NVBUF_COLOR_FORMAT_NV12;
+		}
+#endif
 	}
 
 	if (ctx->enableLossless && param->codingType == NV_VIDEO_CodingH264)
@@ -670,7 +679,7 @@ static int nvmpi_enc_register_dmabuf(nvmpictx* ctx, nvDmaBufFrame* frame)
 
 	if(frame->num_planes != 2)
 	{
-		cerr << "nvmpi: dmabuf import expects 2-plane NV12, got " << frame->num_planes << " planes" << endl;
+		cerr << "nvmpi: dmabuf import expects 2-plane NV12/P010, got " << frame->num_planes << " planes" << endl;
 		return -1;
 	}
 	for(unsigned int i=0; i<frame->num_planes; i++)
@@ -695,7 +704,7 @@ static int nvmpi_enc_register_dmabuf(nvmpictx* ctx, nvDmaBufFrame* frame)
 	mp.totalSize = frame->totalSize;
 	mp.memType = NVBUF_MEM_SURFACE_ARRAY;
 	mp.layout = NVBUF_LAYOUT_PITCH;
-	mp.colorFormat = NVBUF_COLOR_FORMAT_NV12;
+	mp.colorFormat = ctx->dmabufColorFormat;
 	for(unsigned int i=0; i<frame->num_planes; i++)
 	{
 		mp.planes[i].width = frame->width[i];
