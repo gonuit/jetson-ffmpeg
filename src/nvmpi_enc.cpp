@@ -377,6 +377,14 @@ nvmpictx* nvmpi_create_encoder(nvEncParam* param)
 			ctx->raw_pixfmt = V4L2_PIX_FMT_YUV420M;
 	}
 
+	//10-bit input implies HEVC Main 10 (the only 10-bit-capable codec of the
+	//encoder: see the format table in v4l2_nv_extensions.h; AV1 is 8-bit only)
+	if(param->inputPixFormat==NV_PIX_P010 && param->codingType==NV_VIDEO_CodingHEVC)
+	{
+		ctx->profile = V4L2_MPEG_VIDEO_H265_PROFILE_MAIN10;
+		ctx->raw_pixfmt = V4L2_PIX_FMT_P010M;
+	}
+
 	if (ctx->enableLossless && param->codingType == NV_VIDEO_CodingH264)
 	{
 		ctx->profile = V4L2_MPEG_VIDEO_H264_PROFILE_HIGH_444_PREDICTIVE;

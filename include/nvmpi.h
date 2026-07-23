@@ -10,7 +10,8 @@ typedef struct nvmpictx nvmpictx;
 
 typedef enum {
 	NV_PIX_NV12,
-	NV_PIX_YUV420
+	NV_PIX_YUV420,
+	NV_PIX_P010       /**< 10-bit 4:2:0, two planes (Y + interleaved UV), 16 bits per component */
 }nvPixFormat;
 
 typedef enum {
@@ -51,6 +52,10 @@ typedef struct _NVENCPARAM{
 	unsigned int hw_preset_type;
 	unsigned int vbv_buffer_size; //virtual buffer size of the encoder
 	nvCodingType codingType;
+	//raw input format fed to the encoder. NV_PIX_YUV420 (default, 8-bit) or
+	//NV_PIX_P010 (10-bit, HEVC only -> Main 10). Appended last to keep field
+	//offsets of existing users stable; rebuild callers together with the lib.
+	nvPixFormat inputPixFormat;
 } nvEncParam;
 
 typedef struct _NVDECPARAM{

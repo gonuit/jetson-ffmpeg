@@ -206,6 +206,8 @@ static av_cold int nvmpi_encode_init(AVCodecContext *avctx)
 	//param.packet_pool_size=nvmpi_context->packet_pool_size;
 	param.hw_preset_type=nvmpi_context->preset;
 	param.insert_spspps_idr=(avctx->flags & AV_CODEC_FLAG_GLOBAL_HEADER)?0:1;
+	//10-bit input (HEVC only -> Main 10); everything else feeds 8-bit yuv420p
+	param.inputPixFormat=(avctx->pix_fmt == AV_PIX_FMT_P010LE)?NV_PIX_P010:NV_PIX_YUV420;
 	
 	nvmpi_context->frame = av_frame_alloc();
 	if (!nvmpi_context->frame) return AVERROR(ENOMEM);
@@ -648,7 +650,7 @@ static const AVOption av1_options[] = {
 
 
 #if LIBAVCODEC_VERSION_MAJOR >= 60
-	#define NVMPI_ENC(NAME, LONGNAME, CODEC, OPTS) \
+	#define NVMPI_ENC(NAME, LONGNAME, CODEC, OPTS, PIXFMTS) \
 		NVMPI_ENC_CLASS(NAME, OPTS) \
 		FFCodec ff_ ## NAME ## _nvmpi_encoder = { \
 			.p.name           = #NAME "_nvmpi" , \
@@ -660,7 +662,7 @@ static const AVOption av1_options[] = {
 			.init           = nvmpi_encode_init, \
 			FF_CODEC_RECEIVE_PACKET_CB(ff_nvmpi_receive_packet_async), \
 			.close          = nvmpi_encode_close, \
-			.p.pix_fmts       = (const enum AVPixelFormat[]) { AV_PIX_FMT_YUV420P, AV_PIX_FMT_NONE },\
+			.p.pix_fmts       = PIXFMTS,\
 			.p.capabilities   = AV_CODEC_CAP_HARDWARE | AV_CODEC_CAP_DELAY, \
 			.defaults       = defaults,\
 			.p.wrapper_name   = "nvmpi", \
@@ -675,7 +677,7 @@ static const AVOption av1_options[] = {
 				.receive_packet = ff_nvmpi_receive_packet
 	#endif
 	
-	#define NVMPI_ENC(NAME, LONGNAME, CODEC, OPTS) \
+	#define NVMPI_ENC(NAME, LONGNAME, CODEC, OPTS, PIXFMTS) \
 		NVMPI_ENC_CLASS(NAME, OPTS) \
 		AVCodec ff_ ## NAME ## _nvmpi_encoder = { \
 			.name           = #NAME "_nvmpi" , \
@@ -687,13 +689,18 @@ static const AVOption av1_options[] = {
 			.init           = nvmpi_encode_init, \
 			NVMPI_ENC_API_CALLS, \
 			.close          = nvmpi_encode_close, \
-			.pix_fmts       = (const enum AVPixelFormat[]) { AV_PIX_FMT_YUV420P, AV_PIX_FMT_NONE },\
+			.pix_fmts       = PIXFMTS,\
 			.capabilities   = AV_CODEC_CAP_HARDWARE | AV_CODEC_CAP_DELAY, \
 			.defaults       = defaults,\
 			.wrapper_name   = "nvmpi", \
 		};
 #endif
 
-NVMPI_ENC(h264, "H.264", AV_CODEC_ID_H264, options);
-NVMPI_ENC(hevc, "HEVC", AV_CODEC_ID_HEVC, options);
-NVMPI_ENC(av1, "AV1", AV_CODEC_ID_AV1, av1_options);
+#define NVMPI_PIX_FMTS_8BIT (const enum AVPixelFormat[]) { AV_PIX_FMT_YUV420P, AV_PIX_FMT_NONE }
+//10-bit input is HEVC-only: the Orin encoder has no 10-bit AV1 mode (it silently
+//encodes 8-bit) and H.264 HW is 8-bit; see the format table in v4l2_nv_extensions.h
+#define NVMPI_PIX_FMTS_HEVC (const enum AVPixelFormat[]) { AV_PIX_FMT_YUV420P, AV_PIX_FMT_P010LE, AV_PIX_FMT_NONE }
+
+NVMPI_ENC(h264, "H.264", AV_CODEC_ID_H264, options, NVMPI_PIX_FMTS_8BIT);
+NVMPI_ENC(hevc, "HEVC", AV_CODEC_ID_HEVC, options, NVMPI_PIX_FMTS_HEVC);
+NVMPI_ENC(av1, "AV1", AV_CODEC_ID_AV1, av1_options, NVMPI_PIX_FMTS_8BIT);
