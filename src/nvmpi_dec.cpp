@@ -477,8 +477,13 @@ void dec_capture_loop_fcn(void *arg)
 		{
 			struct v4l2_buffer v4l2_buf;
 			struct v4l2_plane planes[MAX_PLANES];
+			//without the memset the V4L2_BUF_FLAG_LAST check below reads stack
+			//garbage when dqBuffer fails before filling the struct (the NVIDIA
+			//sample memsets too)
+			memset(&v4l2_buf, 0, sizeof(v4l2_buf));
+			memset(planes, 0, sizeof(planes));
 			v4l2_buf.m.planes = planes;
-			
+
 			/* Dequeue a filled buffer. */
 			if (dec->capture_plane.dqBuffer(v4l2_buf, &dec_buffer, NULL, 0))
 			{
@@ -491,6 +496,12 @@ void dec_capture_loop_fcn(void *arg)
 					}
 					usleep(1000);
 				}
+				else if (errno == EPIPE)
+				{
+					//stateful decoder spec: DQBUF returns EPIPE once the
+					//V4L2_BUF_FLAG_LAST buffer has been dequeued
+					ctx->eos=true;
+				}
 				else
 				{
 					ERROR_MSG("Error while calling dequeue at capture plane");
@@ -498,7 +509,16 @@ void dec_capture_loop_fcn(void *arg)
 				}
 				break;
 			}
-			
+
+			//in blocking mode DQBUF never returns EAGAIN, so end-of-stream after a
+			//flush arrives as a (possibly empty) buffer with V4L2_BUF_FLAG_LAST set
+			if (v4l2_buf.flags & V4L2_BUF_FLAG_LAST)
+			{
+				ctx->eos=true;
+				if (dec_buffer->planes[0].bytesused == 0)
+					break; //empty EoS marker buffer, no frame to output
+			}
+
 			dec_buffer->planes[0].fd = ctx->dmaBufferFileDescriptor[v4l2_buf.index];
 			
 			fb = ctx->framePool->dqEmptyBuf();
@@ -538,10 +558,13 @@ void dec_capture_loop_fcn(void *arg)
 				}
 			}
 
-			v4l2_buf.m.planes[0].m.fd = ctx->dmaBufferFileDescriptor[v4l2_buf.index];
-			if (dec->capture_plane.qBuffer(v4l2_buf, NULL) < 0)
+			if(!ctx->eos)
 			{
-				ERROR_MSG("Error while queueing buffer at decoder capture plane");
+				v4l2_buf.m.planes[0].m.fd = ctx->dmaBufferFileDescriptor[v4l2_buf.index];
+				if (dec->capture_plane.qBuffer(v4l2_buf, NULL) < 0)
+				{
+					ERROR_MSG("Error while queueing buffer at decoder capture plane");
+				}
 			}
 		}
 	}
@@ -657,7 +680,8 @@ int nvmpi_decoder_put_packet(nvmpictx* ctx,nvPacket* packet)
 		}
 	}
 
-	memcpy(nvBuffer->planes[0].data,packet->payload,packet->payload_size);
+	if(packet->payload_size)
+		memcpy(nvBuffer->planes[0].data,packet->payload,packet->payload_size);
 	nvBuffer->planes[0].bytesused=packet->payload_size;
 	v4l2_buf.m.planes[0].bytesused = nvBuffer->planes[0].bytesused;
 
@@ -673,11 +697,10 @@ int nvmpi_decoder_put_packet(nvmpictx* ctx,nvPacket* packet)
 		return -2;
 	}
 
-	if (v4l2_buf.m.planes[0].bytesused == 0)
-	{
-		ctx->eos=true;
-		//std::cout << "Input file read complete" << std::endl; //TODO log it
-	}
+	//A zero-sized buffer starts the decoder flush sequence. Do NOT set
+	//ctx->eos here: that would stop the capture loop before the decoder
+	//has delivered its buffered (reordered) frames. The capture loop ends
+	//when the driver flags the last buffer (V4L2_BUF_FLAG_LAST).
 
 	return 0;
 }
@@ -733,6 +756,17 @@ int nvmpi_decoder_get_frame(nvmpictx* ctx,nvFrame* frame,bool wait)
 {
 	int ret;
 	NVMPI_frameBuf* fb = ctx->framePool->dqFilledBuf();
+	if(!fb && wait)
+	{
+		//block until a frame arrives or the capture side is done (EOS/error)
+		while(!fb && !(ctx->eos || ctx->dec->isInError()))
+		{
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			fb = ctx->framePool->dqFilledBuf();
+		}
+		//the capture loop may have queued a last frame right before setting eos
+		if(!fb) fb = ctx->framePool->dqFilledBuf();
+	}
 	if(!fb) return -1;
 	
 	ret = copyNvBufToFrame(ctx, fb, frame);

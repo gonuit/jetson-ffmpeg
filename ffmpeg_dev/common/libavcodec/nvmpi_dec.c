@@ -154,6 +154,13 @@ static int nvmpi_decode(AVCodecContext *avctx, void *data, int *got_frame, AVPac
 	int res;
 	int decode_ret = avpkt->size;
 
+	_nvframe.payload[0] = bufFrame->data[0];
+	_nvframe.payload[1] = bufFrame->data[1];
+	_nvframe.payload[2] = bufFrame->data[2];
+	_nvframe.linesize[0] = bufFrame->linesize[0];
+	_nvframe.linesize[1] = bufFrame->linesize[1];
+	_nvframe.linesize[2] = bufFrame->linesize[2];
+
 	if(avpkt->size)
 	{
 		packet.payload_size=avpkt->size;
@@ -169,16 +176,32 @@ static int nvmpi_decode(AVCodecContext *avctx, void *data, int *got_frame, AVPac
 			}
 			//TODO error handling
 		}
+
+		res=nvmpi_decoder_get_frame(nvmpi_context->ctx,&_nvframe,avctx->flags & AV_CODEC_FLAG_LOW_DELAY);
 	}
-
-	_nvframe.payload[0] = bufFrame->data[0];
-	_nvframe.payload[1] = bufFrame->data[1];
-	_nvframe.payload[2] = bufFrame->data[2];
-	_nvframe.linesize[0] = bufFrame->linesize[0];
-	_nvframe.linesize[1] = bufFrame->linesize[1];
-	_nvframe.linesize[2] = bufFrame->linesize[2];
-
-	res=nvmpi_decoder_get_frame(nvmpi_context->ctx,&_nvframe,avctx->flags & AV_CODEC_FLAG_LOW_DELAY);
+	else
+	{
+		//draining. Sweep already-decoded frames non-blocking first: sending the
+		//flush packet below can block on a free output-plane buffer, which the
+		//decoder can only release once the frame pool has space, so the flush
+		//must only be queued when the pool is empty (deadlock otherwise).
+		res=nvmpi_decoder_get_frame(nvmpi_context->ctx,&_nvframe,false);
+		if(res<0)
+		{
+			if(!nvmpi_context->eos_reached)
+			{
+				//zero-sized packet starts the decoder flush; the capture side
+				//signals completion (V4L2_BUF_FLAG_LAST) through get_frame
+				packet.payload_size=0;
+				packet.payload=NULL;
+				packet.pts=0;
+				nvmpi_decoder_put_packet(nvmpi_context->ctx,&packet);
+				nvmpi_context->eos_reached=1;
+			}
+			//block until the flush delivers the next remaining frame or ends
+			res=nvmpi_decoder_get_frame(nvmpi_context->ctx,&_nvframe,true);
+		}
+	}
 
 	if(res<0)
 	{
