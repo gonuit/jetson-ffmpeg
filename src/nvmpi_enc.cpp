@@ -7,6 +7,8 @@
 #include <vector>
 #include <iostream>
 #include <thread>
+#include <atomic>
+#include <chrono>
 #include <unistd.h>
 
 #define MAX_BUFFERS 32
@@ -48,8 +50,11 @@ struct nvmpictx
 	bool enable_extended_colorformat;
 	bool enableLossless;
 	bool blocking_mode;
-	bool capPlaneGotEOS;
-	bool flushing;
+	//shared between the DQ thread and the API threads
+	std::atomic<bool> capPlaneGotEOS;
+	std::atomic<bool> flushing;
+	std::atomic<bool> enc_shutdown;   //set by nvmpi_encoder_close to release a waiting DQ callback
+	std::atomic<bool> dqThreadRunning;
 
 	enum v4l2_mpeg_video_bitrate_mode ratecontrol;
 	enum v4l2_mpeg_video_h264_level level;
@@ -68,43 +73,64 @@ static bool encoder_capture_plane_dq_callback(struct v4l2_buffer *v4l2_buf, NvBu
 	if (v4l2_buf == NULL)
 	{
 		cerr << "Error while dequeing buffer from output plane" << endl;
+		ctx->dqThreadRunning = false;
 		return false;
 	}
 
 	if (buffer->planes[0].bytesused == 0)
 	{
 		ctx->capPlaneGotEOS = true;
-		//cerr << "Got 0 size buffer in capture \n"; //TODO  log it
+		ctx->dqThreadRunning = false;
 		return false;
 	}
-	
+
 	v4l2_ctrl_videoenc_outputbuf_metadata enc_metadata;
 	ctx->enc->getMetadata(v4l2_buf->index, enc_metadata);
-	
+
 	//nvPacket.payload --> AVPacket->data
 	//nvPacket.privData --> AVPacket
 	nvPacket* pkt = ctx->pktPool->dqEmptyBuf();
 	if(!pkt)
 	{
-		//TODO wait for user to read buffer. make send_frame return AVERROR(EAGAIN) until avcodec_receive_packet() is called
-		//TODO pass warning to avlog
-		fprintf(stderr, "[libnvmpi][W]: EAGAIN. User must read output. nvmpi encoder packet memory pool is empty! Packet will be dropped. There may be artifacts in the output video.\n");
+		//Backpressure: hold this capture buffer (stalling the HW encoder) until
+		//the consumer frees a packet slot. The wait is time-capped: a consumer
+		//that abandons the stream and goes straight to close would otherwise
+		//deadlock against put_frame(NULL) blocking in DQBUF before
+		//enc_shutdown can ever be set.
+		const int max_wait_ms = 10000;
+		int waited_ms = 0;
+		while(!pkt && !ctx->enc_shutdown && !ctx->enc->isInError() && waited_ms < max_wait_ms)
+		{
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			waited_ms++;
+			pkt = ctx->pktPool->dqEmptyBuf();
+		}
+		if(!pkt && (ctx->enc_shutdown || ctx->enc->isInError()))
+		{
+			//teardown or hard error: this packet is lost by design
+			ctx->dqThreadRunning = false;
+			return false;
+		}
+		if(!pkt)
+		{
+			fprintf(stderr, "[libnvmpi][W]: packet pool empty for %d ms, dropping packet. There may be artifacts in the output video.\n", max_wait_ms);
+		}
 	}
-	else
+	if(pkt)
 	{
 		pkt->pts = (v4l2_buf->timestamp.tv_usec % 1000000) + (v4l2_buf->timestamp.tv_sec * 1000000UL);
 		//AV_PKT_FLAG_KEY 0x0001. if current packet is keyframe then enc_metadata.KeyFrame should be 0x1, so it should be OK to just assign value
 		pkt->flags = enc_metadata.KeyFrame;
 		pkt->payload_size = buffer->planes[0].bytesused;
 		memcpy(pkt->payload, buffer->planes[0].data, pkt->payload_size);
-		
+
 		ctx->pktPool->qFilledBuf(pkt);
 	}
-	
+
 	if (ctx->enc->capture_plane.qBuffer(*v4l2_buf, NULL) < 0)
 	{
-		//TODO error handling
 		ERROR_MSG("Error while Qing buffer at capture plane");
+		ctx->dqThreadRunning = false;
 		return false;
 	}
 
@@ -221,6 +247,8 @@ nvmpictx* nvmpi_create_encoder(nvEncParam* param)
 	ctx->insert_sps_pps_at_idr=(param->insert_spspps_idr==1)?true:false;
 	ctx->capPlaneGotEOS = false;
 	ctx->flushing = false;
+	ctx->enc_shutdown = false;
+	ctx->dqThreadRunning = false;
 	ctx->blocking_mode = true; //TODO non-blocking mode support
 	ctx->max_perf = true; //TODO invistigate why encoder is slow without max_perf even with MAXN power mode
 	ctx->vbv_buffer_size = param->vbv_buffer_size;
@@ -519,6 +547,7 @@ nvmpictx* nvmpi_create_encoder(nvEncParam* param)
 	if(ctx->blocking_mode)
 	{
 		ctx->enc->capture_plane.setDQThreadCallback(encoder_capture_plane_dq_callback);
+		ctx->dqThreadRunning = true;
 		ctx->enc->capture_plane.startDQThread(ctx);
 	}
     else
@@ -619,7 +648,7 @@ int nvmpi_encoder_put_frame(nvmpictx* ctx,nvFrame* frame)
 		if (ret < 0)
 		{
 			cerr << "Error DQing buffer at output plane" << std::endl;
-			return false;
+			return -1;
 		}
 	}
 	
@@ -701,7 +730,9 @@ int nvmpi_encoder_get_packet(nvmpictx* ctx,nvPacket** packet)
 		while(wait)
 		{
 			pkt = ctx->pktPool->dqFilledBuf();
-			if(pkt || ctx->capPlaneGotEOS) wait = false;
+			//also stop waiting if the DQ thread died without delivering EOS
+			//(error paths), otherwise this would spin forever
+			if(pkt || ctx->capPlaneGotEOS || !ctx->dqThreadRunning) wait = false;
 			std::this_thread::sleep_for(std::chrono::milliseconds(1));
 		}
 		if(!pkt) return -2; //if got eos
@@ -715,8 +746,13 @@ int nvmpi_encoder_close(nvmpictx* ctx)
 {
 	if(ctx->blocking_mode)
 	{
+		//release a DQ callback blocked in the backpressure wait; stopDQThread
+		//itself is a no-op in blocking mode (the thread only exits when the
+		//callback returns false)
+		ctx->enc_shutdown = true;
 		ctx->enc->capture_plane.stopDQThread();
-		ctx->enc->capture_plane.waitForDQThread(1000);
+		if(ctx->enc->capture_plane.waitForDQThread(1000) < 0)
+			cerr << "[libnvmpi][W]: encoder DQ thread did not stop within 1s" << endl;
 	}
 	else
 	{

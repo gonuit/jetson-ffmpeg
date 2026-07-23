@@ -356,8 +356,9 @@ static av_cold int nvmpi_encode_init(AVCodecContext *avctx)
 			
 			nvmpienc_nvPacket_free(nPkt);
 			nPkt = nvmpienc_nvPacket_alloc(avctx, NVMPI_ENC_CHUNK_SIZE);
-			
-			//return buffer to pool
+
+			//return buffer to pool. Must happen before put_frame(NULL): the
+			//flush can only complete if the DQ thread has a free packet slot.
 			nvmpi_encoder_qEmptyPacket(nvmpi_context->ctx, nPkt);
 			//send eos
 			nvmpi_encoder_put_frame(nvmpi_context->ctx,NULL);
