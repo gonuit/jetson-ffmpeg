@@ -1,3 +1,4 @@
+#pragma once
 #if defined(WITH_NVUTILS)
 #include "nvbufsurface.h"
 #include "nvbufsurftransform.h"
@@ -20,7 +21,15 @@
 #define NvBufferTransformParams NvBufSurfTransformParams
 #define NvBufferRect NvBufSurfTransformRect
 #define NVBUFFER_TRANSFORM_FILTER NVBUFSURF_TRANSFORM_FILTER
+#define NVBUFFER_TRANSFORM_CROP_SRC NVBUFSURF_TRANSFORM_CROP_SRC
+#define NVBUFFER_TRANSFORM_FLIP NVBUFSURF_TRANSFORM_FLIP
+#define NvBufferTransform_Flip NvBufSurfTransform_Flip
 #define NvBufferTransform_None NvBufSurfTransform_None
+#define NvBufferTransform_Rotate90 NvBufSurfTransform_Rotate90
+#define NvBufferTransform_Rotate180 NvBufSurfTransform_Rotate180
+#define NvBufferTransform_Rotate270 NvBufSurfTransform_Rotate270
+#define NvBufferTransform_FlipX NvBufSurfTransform_FlipX
+#define NvBufferTransform_FlipY NvBufSurfTransform_FlipY
 #define NvBufferTransform_Filter_Smart NvBufSurfTransformInter_Algo3
 #define NvBufferTransform_Filter_Nearest NvBufSurfTransformInter_Nearest
 #define NvBufferParams NvBufSurfTransform
@@ -30,3 +39,23 @@
 #else
 #include "nvbuf_utils.h"
 #endif
+
+#include "nvmpi.h"
+
+//nvTransform -> VIC flip enum. nvbufsurftransform.h documents
+//NvBufSurfTransform_Rotate* as clockwise but the VIC actually rotates
+//counter-clockwise (verified on device, matching the 07_video_convert sample
+//help), hence the 90/270 swap. Likewise FlipX mirrors left<->right despite
+//the "X-axis" name. If a JetPack inverts either, swap the pairs back here.
+static inline NvBufferTransform_Flip nvmpi_map_transform(unsigned int t)
+{
+	switch(t)
+	{
+		case NV_TRANSFORM_ROTATE90:  return NvBufferTransform_Rotate270;
+		case NV_TRANSFORM_ROTATE180: return NvBufferTransform_Rotate180;
+		case NV_TRANSFORM_ROTATE270: return NvBufferTransform_Rotate90;
+		case NV_TRANSFORM_FLIP_H:    return NvBufferTransform_FlipX;
+		case NV_TRANSFORM_FLIP_V:    return NvBufferTransform_FlipY;
+		default:                     return NvBufferTransform_None;
+	}
+}

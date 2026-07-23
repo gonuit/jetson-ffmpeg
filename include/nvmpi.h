@@ -30,6 +30,23 @@ typedef struct _NVSIZE{
 	unsigned int height;
 }nvSize;
 
+typedef struct _NVRECT{
+	unsigned int left;
+	unsigned int top;
+	unsigned int width;    /**< 0 = crop disabled */
+	unsigned int height;
+}nvRect;
+
+//VIC transform applied after crop and scale. Rotation is clockwise.
+typedef enum {
+	NV_TRANSFORM_NONE = 0,
+	NV_TRANSFORM_ROTATE90,
+	NV_TRANSFORM_ROTATE180,
+	NV_TRANSFORM_ROTATE270,
+	NV_TRANSFORM_FLIP_H,   /**< horizontal mirror */
+	NV_TRANSFORM_FLIP_V,   /**< vertical mirror */
+} nvTransform;
+
 typedef struct _NVENCPARAM{
 	unsigned int width;
 	unsigned int height;
@@ -63,6 +80,9 @@ typedef struct _NVDECPARAM{
 	nvCodingType codingType;
 	nvPixFormat pixFormat;
 	nvSize resized;
+	//appended last to keep field offsets of existing users stable
+	nvRect srcCrop;          /**< rect in visible-frame coords; all-zero = off */
+	unsigned int transform;  /**< nvTransform, applied after crop and resize */
 } nvDecParam;
 
 typedef struct _NVPACKET{

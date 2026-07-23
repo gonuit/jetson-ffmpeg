@@ -51,7 +51,7 @@ This library provides the ability to use hardware acceleration for video encodin
   - H.265/HEVC (ffmpeg codec name: hevc_nvmpi)
   
 ### Other Features
-  - Hardware accelerated video scaling during decoding
+  - Hardware accelerated (VIC) crop, scaling, rotation and mirroring during decoding
 
 ### Building and usage
 **1.build and install library**
@@ -99,6 +99,17 @@ Build with stubs and custom dirs example:
 **Decode h264 video with fast scaling during decoding example**
 
     ffmpeg -c:v h264_nvmpi -resize:v 1920x1080 -i <input.mp4> -f null -
+
+**Decode with hardware crop/scale/rotate during decoding example**
+
+All geometry is done in the single VIC pass the decoder already performs.
+`crop` selects a region of the source picture (insets: top x bottom x left x right),
+`resize` scales it (pre-rotation size), `rotate` (clockwise) or `flip` is applied
+last — so `-resize 1280x720 -rotate 90` produces a 720x1280 output.
+`rotate` and `flip` are mutually exclusive.
+
+    ffmpeg -c:v h264_nvmpi -crop 0x0x280x280 -resize 1280x720 -rotate 90 -i <input.mp4> -f null -
+    ffmpeg -c:v h264_nvmpi -flip h -i <input.mp4> -f null -
   
 **Encode h264 video example**
 

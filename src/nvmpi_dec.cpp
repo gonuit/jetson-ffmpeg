@@ -32,7 +32,9 @@ struct nvmpictx
 	unsigned int output_width{0};
 	unsigned int output_height{0};
 	nvSize resized{0, 0};
-	
+	nvRect srcCrop{0, 0, 0, 0};
+	unsigned int transform{NV_TRANSFORM_NONE};
+
 	int numberCaptureBuffers{0};
 	
 	int dmaBufferFileDescriptor[MAX_BUFFERS];
@@ -270,18 +272,21 @@ void nvmpictx::updateFrameSizeParams()
 
 void nvmpictx::updateBufferTransformParams()
 {
-	src_rect.top = 0;
-	src_rect.left = 0;
-	src_rect.width = coded_width;
-	src_rect.height = coded_height;
+	//srcCrop was clamped against coded dims in respondToResolutionEvent
+	src_rect.top = srcCrop.width ? srcCrop.top : 0;
+	src_rect.left = srcCrop.width ? srcCrop.left : 0;
+	src_rect.width = srcCrop.width ? srcCrop.width : coded_width;
+	src_rect.height = srcCrop.width ? srcCrop.height : coded_height;
 	dest_rect.top = 0;
 	dest_rect.left = 0;
 	dest_rect.width = output_width;
 	dest_rect.height = output_height;
-	
+
 	memset(&transform_params,0,sizeof(transform_params));
-	transform_params.transform_flag = NVBUFFER_TRANSFORM_FILTER;
-	transform_params.transform_flip = NvBufferTransform_None;
+	transform_params.transform_flag = NVBUFFER_TRANSFORM_FILTER
+		| (srcCrop.width ? NVBUFFER_TRANSFORM_CROP_SRC : 0)
+		| (transform != NV_TRANSFORM_NONE ? NVBUFFER_TRANSFORM_FLIP : 0);
+	transform_params.transform_flip = nvmpi_map_transform(transform);
 	transform_params.transform_filter = NvBufferTransform_Filter_Smart;
 	//ctx->transform_params.transform_filter = NvBufSurfTransformInter_Nearest;
 #ifdef WITH_NVUTILS
@@ -361,8 +366,33 @@ void respondToResolutionEvent(v4l2_format &format, v4l2_crop &crop,nvmpictx* ctx
 
 	ctx->coded_width = crop.c.width;
 	ctx->coded_height = crop.c.height;
-	ctx->output_width = ctx->resized.width ? ctx->resized.width : crop.c.width;
-	ctx->output_height = ctx->resized.height ? ctx->resized.height : crop.c.height;
+
+	//the wrapper validates the crop against the demuxer dims at create time.
+	//This runs async after a resolution event where failing cleanly is not
+	//possible, so on mismatch (demuxer lied or mid-stream resolution change)
+	//clamp into bounds and warn instead.
+	unsigned int src_w = ctx->coded_width, src_h = ctx->coded_height;
+	if(ctx->srcCrop.width)
+	{
+		if(ctx->srcCrop.left >= ctx->coded_width) ctx->srcCrop.left = 0;
+		if(ctx->srcCrop.top >= ctx->coded_height) ctx->srcCrop.top = 0;
+		if(ctx->srcCrop.left + ctx->srcCrop.width > ctx->coded_width ||
+		   ctx->srcCrop.top + ctx->srcCrop.height > ctx->coded_height)
+		{
+			ctx->srcCrop.width = ctx->coded_width - ctx->srcCrop.left;
+			ctx->srcCrop.height = ctx->coded_height - ctx->srcCrop.top;
+			std::cerr << "nvmpi: crop rect out of stream bounds, clamped to "
+				<< ctx->srcCrop.width << "x" << ctx->srcCrop.height
+				<< "+" << ctx->srcCrop.left << "+" << ctx->srcCrop.top << std::endl;
+		}
+		src_w = ctx->srcCrop.width;
+		src_h = ctx->srcCrop.height;
+	}
+	unsigned int pre_w = ctx->resized.width ? ctx->resized.width : src_w;
+	unsigned int pre_h = ctx->resized.height ? ctx->resized.height : src_h;
+	bool swapDims = (ctx->transform == NV_TRANSFORM_ROTATE90 || ctx->transform == NV_TRANSFORM_ROTATE270);
+	ctx->output_width = swapDims ? pre_h : pre_w;
+	ctx->output_height = swapDims ? pre_w : pre_h;
 	
 	//init/reinit DecoderCapturePlane
 	ctx->deinitDecoderCapturePlane();
@@ -661,6 +691,8 @@ nvmpictx* nvmpi_create_decoder(nvDecParam* param)
 
 	ctx->out_pixfmt=param->pixFormat;
 	ctx->resized = param->resized;
+	ctx->srcCrop = param->srcCrop;
+	ctx->transform = param->transform;
 	ctx->framePool = new NVMPI_bufPool<NVMPI_frameBuf*>();
 	ctx->eos=false;
 	ctx->index=0;

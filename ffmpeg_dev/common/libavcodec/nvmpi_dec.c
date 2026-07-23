@@ -32,6 +32,9 @@ typedef struct {
 	nvmpictx* ctx;
 	AVFrame *bufFrame;
 	char *resize_expr;
+	char *crop_expr;
+	int rotate;
+	int flip;
 	int frame_pool_size;
 	char eos_reached;
 } nvmpiDecodeContext;
@@ -119,12 +122,89 @@ static int nvmpi_init_decoder(AVCodecContext *avctx)
         av_log(avctx, AV_LOG_ERROR, "Invalid resize expressions\n");
         return AVERROR(EINVAL);
     }
-	
-	//overwrite avctx w and h if resize option is used
-	if(param.resized.width && param.resized.height)
+
+	//4:2:0 output needs even geometry; it also keeps the wrapper and the
+	//library agreeing on the exact output size
+	if((param.resized.width & 1) || (param.resized.height & 1))
 	{
-		avctx->width = param.resized.width;
-		avctx->height = param.resized.height;
+		param.resized.width &= ~1;
+		param.resized.height &= ~1;
+		av_log(avctx, AV_LOG_INFO, "resize adjusted to even geometry: %ux%u\n",
+		       param.resized.width, param.resized.height);
+	}
+
+	if(nvmpi_context->crop_expr)
+	{
+		int top, bottom, left, right, cw, ch;
+		if(sscanf(nvmpi_context->crop_expr, "%dx%dx%dx%d", &top, &bottom, &left, &right) != 4 ||
+		   top < 0 || bottom < 0 || left < 0 || right < 0)
+		{
+			av_log(avctx, AV_LOG_ERROR, "Invalid cropping expressions\n");
+			return AVERROR(EINVAL);
+		}
+		if(avctx->width <= 0 || avctx->height <= 0)
+		{
+			av_log(avctx, AV_LOG_ERROR, "crop requires known stream dimensions\n");
+			return AVERROR(EINVAL);
+		}
+		if(left + right >= avctx->width || top + bottom >= avctx->height)
+		{
+			av_log(avctx, AV_LOG_ERROR, "crop %dx%dx%dx%d exceeds stream dimensions %dx%d\n",
+			       top, bottom, left, right, avctx->width, avctx->height);
+			return AVERROR(EINVAL);
+		}
+		cw = avctx->width - left - right;
+		ch = avctx->height - top - bottom;
+		param.srcCrop.left = left & ~1;
+		param.srcCrop.top = top & ~1;
+		param.srcCrop.width = cw & ~1;
+		param.srcCrop.height = ch & ~1;
+		if((left | top | cw | ch) & 1)
+			av_log(avctx, AV_LOG_INFO, "crop rect adjusted to even geometry: %ux%u+%u+%u\n",
+			       param.srcCrop.width, param.srcCrop.height, param.srcCrop.left, param.srcCrop.top);
+	}
+
+	switch(nvmpi_context->rotate)
+	{
+		case 0: break;
+		case 90: param.transform = NV_TRANSFORM_ROTATE90; break;
+		case 180: param.transform = NV_TRANSFORM_ROTATE180; break;
+		case 270: param.transform = NV_TRANSFORM_ROTATE270; break;
+		default:
+			av_log(avctx, AV_LOG_ERROR, "rotate must be one of 0, 90, 180, 270\n");
+			return AVERROR(EINVAL);
+	}
+	if(nvmpi_context->flip)
+	{
+		if(param.transform != NV_TRANSFORM_NONE)
+		{
+			av_log(avctx, AV_LOG_ERROR, "rotate and flip are mutually exclusive\n");
+			return AVERROR(EINVAL);
+		}
+		param.transform = (nvmpi_context->flip == 1) ? NV_TRANSFORM_FLIP_H : NV_TRANSFORM_FLIP_V;
+	}
+
+	//final output size: crop selects the source region, resize scales it,
+	//rotation/flip is applied last (90/270 swap the dimensions)
+	{
+		unsigned int out_w = avctx->width, out_h = avctx->height;
+		if(param.srcCrop.width)
+		{
+			out_w = param.srcCrop.width;
+			out_h = param.srcCrop.height;
+		}
+		if(param.resized.width && param.resized.height)
+		{
+			out_w = param.resized.width;
+			out_h = param.resized.height;
+		}
+		if(param.transform == NV_TRANSFORM_ROTATE90 || param.transform == NV_TRANSFORM_ROTATE270)
+			FFSWAP(unsigned int, out_w, out_h);
+		if(out_w && out_h)
+		{
+			avctx->width = out_w;
+			avctx->height = out_h;
+		}
 	}
 
 	nvmpi_context->bufFrame = av_frame_alloc();
@@ -258,6 +338,16 @@ static int nvmpi_decode(AVCodecContext *avctx, void *data, int *got_frame, AVPac
 #define VD AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_DECODING_PARAM
 static const AVOption options[] = {
     { "resize",   "Resize (width)x(height)", OFFSET(resize_expr), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, VD, "resize" },
+    { "crop",     "Crop (top)x(bottom)x(left)x(right) of the source before scaling", OFFSET(crop_expr), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, VD, "crop" },
+    { "rotate",   "Rotate output clockwise, applied after crop and resize (90/270 swap the output dimensions)", OFFSET(rotate), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 270, VD, "rotate" },
+    { "0",   "no rotation", 0, AV_OPT_TYPE_CONST, { .i64 = 0 },   0, 0, VD, "rotate" },
+    { "90",  "",            0, AV_OPT_TYPE_CONST, { .i64 = 90 },  0, 0, VD, "rotate" },
+    { "180", "",            0, AV_OPT_TYPE_CONST, { .i64 = 180 }, 0, 0, VD, "rotate" },
+    { "270", "",            0, AV_OPT_TYPE_CONST, { .i64 = 270 }, 0, 0, VD, "rotate" },
+    { "flip",     "Mirror output, mutually exclusive with rotate", OFFSET(flip), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 2, VD, "flip" },
+    { "none", "no mirroring",      0, AV_OPT_TYPE_CONST, { .i64 = 0 }, 0, 0, VD, "flip" },
+    { "h",    "horizontal mirror", 0, AV_OPT_TYPE_CONST, { .i64 = 1 }, 0, 0, VD, "flip" },
+    { "v",    "vertical mirror",   0, AV_OPT_TYPE_CONST, { .i64 = 2 }, 0, 0, VD, "flip" },
     { "frame_pool_size", "Number of frames that could be buffered in the decoder before user must read it with avcodec_receive_frame()", OFFSET(frame_pool_size), AV_OPT_TYPE_INT, {.i64 = OPT_frame_pool_size_DEFAULT }, OPT_frame_pool_size_MIN, OPT_frame_pool_size_MAX, VD, "frame_pool_size" },
     { NULL }
 };
