@@ -577,6 +577,26 @@ void dec_capture_loop_fcn(void *arg)
 }
 
 //TODO: accept in nvmpi_create_decoder input stream params (width and height, etc...) from ffmpeg.
+
+//teardown of a partially initialized decoder context; returns NULL so
+//creation sites can fail in one expression
+static nvmpictx* nvmpi_dec_create_fail(nvmpictx* ctx)
+{
+	std::cerr << "[libnvmpi][E]: decoder creation failed" << std::endl;
+	ctx->eos = true;
+	if(ctx->dec) { delete ctx->dec; ctx->dec = nullptr; }
+	if(ctx->framePool) { delete ctx->framePool; ctx->framePool = nullptr; }
+	delete ctx;
+	return NULL;
+}
+
+#define DEC_CHECK(condition, message)                        \
+	if (condition)                                       \
+{                                                            \
+	std::cerr << message << std::endl;                   \
+	return nvmpi_dec_create_fail(ctx);                   \
+}
+
 nvmpictx* nvmpi_create_decoder(nvDecParam* param)
 {
 	int ret;
@@ -585,10 +605,10 @@ nvmpictx* nvmpi_create_decoder(nvDecParam* param)
 	nvmpictx* ctx=new nvmpictx();
 
 	ctx->dec = NvVideoDecoder::createVideoDecoder("dec0");
-	TEST_ERROR(!ctx->dec, "Could not create decoder",ret);
+	DEC_CHECK(!ctx->dec, "Could not create decoder");
 
 	ret=ctx->dec->subscribeEvent(V4L2_EVENT_RESOLUTION_CHANGE, 0, 0);
-	TEST_ERROR(ret < 0, "Could not subscribe to V4L2_EVENT_RESOLUTION_CHANGE", ret);
+	DEC_CHECK(ret < 0, "Could not subscribe to V4L2_EVENT_RESOLUTION_CHANGE");
 	
 	ctx->frame_pool_size = param->frame_pool_size;
 	
@@ -624,20 +644,20 @@ nvmpictx* nvmpi_create_decoder(nvDecParam* param)
 
 	ret=ctx->dec->setOutputPlaneFormat(ctx->decoder_pixfmt, CHUNK_SIZE);
 
-	TEST_ERROR(ret < 0, "Could not set output plane format", ret);
+	DEC_CHECK(ret < 0, "Could not set output plane format");
 
 	ret = ctx->dec->setFrameInputMode(0);
-	TEST_ERROR(ret < 0, "Error in decoder setFrameInputMode for NALU", ret);
+	DEC_CHECK(ret < 0, "Error in decoder setFrameInputMode for NALU");
 	
 	//TODO: create option to enable max performace mode (?)
 	//ret = ctx->dec->setMaxPerfMode(true);
 	//TEST_ERROR(ret < 0, "Error while setting decoder to max perf", ret);
 
 	ret = ctx->dec->output_plane.setupPlane(V4L2_MEMORY_USERPTR, 10, false, true);
-	TEST_ERROR(ret < 0, "Error while setting up output plane", ret);
+	DEC_CHECK(ret < 0, "Error while setting up output plane");
 
 	ctx->dec->output_plane.setStreamStatus(true);
-	TEST_ERROR(ret < 0, "Error in output plane stream on", ret);
+	DEC_CHECK(ret < 0, "Error in output plane stream on");
 
 	ctx->out_pixfmt=param->pixFormat;
 	ctx->resized = param->resized;
@@ -780,6 +800,7 @@ int nvmpi_decoder_get_frame(nvmpictx* ctx,nvFrame* frame,bool wait)
 
 int nvmpi_decoder_close(nvmpictx* ctx)
 {
+	if(!ctx) return -1;
 	ctx->eos=true;
 	ctx->dec->capture_plane.setStreamStatus(false);
 	if (ctx->dec_capture_loop.joinable())

@@ -218,12 +218,36 @@ static int setup_output_dmabuf(nvmpictx *ctx, uint32_t num_buffers )
 }
 #endif
 
+
+//teardown of a partially initialized encoder context; returns NULL so
+//creation sites can fail in one expression
+static nvmpictx* nvmpi_enc_create_fail(nvmpictx* ctx)
+{
+	std::cerr << "[libnvmpi][E]: encoder creation failed" << std::endl;
+	ctx->enc_shutdown = true;
+	if(ctx->enc) { delete ctx->enc; ctx->enc = nullptr; }
+	if(ctx->pktPool) { delete ctx->pktPool; ctx->pktPool = nullptr; }
+#if (OUTPLANE_MEMTYPE == OUTPLANE_MEMTYPE_DMA)
+	delete[] ctx->output_plane_fd;
+#endif
+	delete ctx;
+	return NULL;
+}
+
+#define ENC_CHECK(condition, message)                        \
+	if (condition)                                       \
+{                                                            \
+	std::cerr << message << std::endl;                   \
+	return nvmpi_enc_create_fail(ctx);                   \
+}
+
 nvmpictx* nvmpi_create_encoder(nvEncParam* param)
 {
 	int ret;
 	log_level = LOG_LEVEL_INFO;
 	//log_level = LOG_LEVEL_DEBUG;
 	nvmpictx *ctx=new nvmpictx;
+	ctx->enc=NULL;
 	ctx->index=0;
 	ctx->width=param->width;
 	ctx->height=param->height;
@@ -368,11 +392,11 @@ nvmpictx* nvmpi_create_encoder(nvEncParam* param)
 	{
 		ctx->enc = NvVideoEncoder::createVideoEncoder("enc0", O_NONBLOCK);
 	}
-	TEST_ERROR(!ctx->enc, "Could not create encoder",ret);
+	ENC_CHECK(!ctx->enc, "Could not create encoder");
 
 	ret = ctx->enc->setCapturePlaneFormat(ctx->encoder_pixfmt, ctx->width,ctx->height, NVMPI_ENC_CHUNK_SIZE);
 
-	TEST_ERROR(ret < 0, "Could not set output plane format", ret);
+	ENC_CHECK(ret < 0, "Could not set output plane format");
 
 #ifdef V4L2_CID_MPEG_VIDEOENC_AV1_HEADERS_WITH_FRAME
 	if(param->codingType==NV_VIDEO_CodingAV1)
@@ -391,7 +415,7 @@ nvmpictx* nvmpi_create_encoder(nvEncParam* param)
 		ectrl.id = V4L2_CID_MPEG_VIDEOENC_AV1_HEADERS_WITH_FRAME;
 		ectrl.value = 0;
 		ret = ctx->enc->setExtControls(ectrls);
-		TEST_ERROR(ret < 0, "Could not disable AV1 IVF headers", ret);
+		ENC_CHECK(ret < 0, "Could not disable AV1 IVF headers");
 	}
 #endif
 
@@ -423,57 +447,57 @@ nvmpictx* nvmpi_create_encoder(nvEncParam* param)
 		ret = ctx->enc->setOutputPlaneFormat(ctx->raw_pixfmt, ctx->width,ctx->height);
 	}
 
-	TEST_ERROR(ret < 0, "Could not set output plane format", ret);
+	ENC_CHECK(ret < 0, "Could not set output plane format");
 
 	ret = ctx->enc->setBitrate(ctx->bitrate);
-	TEST_ERROR(ret < 0, "Could not set encoder bitrate", ret);
+	ENC_CHECK(ret < 0, "Could not set encoder bitrate");
 
 	if(ctx->vbv_buffer_size)
 	{
 		/* Set virtual buffer size value for encoder */
 		ret = ctx->enc->setVirtualBufferSize(ctx->vbv_buffer_size);
-		TEST_ERROR(ret < 0, "Could not set virtual buffer size", ret);
+		ENC_CHECK(ret < 0, "Could not set virtual buffer size");
 	}
 
 	ret=ctx->enc->setHWPresetType(ctx->hw_preset_type);
-	TEST_ERROR(ret < 0, "Could not set encoder HW Preset Type", ret);
+	ENC_CHECK(ret < 0, "Could not set encoder HW Preset Type");
 
 	if(ctx->num_reference_frames)
 	{
 		ret = ctx->enc->setNumReferenceFrames(ctx->num_reference_frames);
-		TEST_ERROR(ret < 0, "Could not set num reference frames", ret);
+		ENC_CHECK(ret < 0, "Could not set num reference frames");
 	}
 
 	if(ctx->num_b_frames != (uint32_t) -1 && param->codingType == NV_VIDEO_CodingH264)
 	{
 		ret = ctx->enc->setNumBFrames(ctx->num_b_frames);
-		TEST_ERROR(ret < 0, "Could not set number of B Frames", ret);
+		ENC_CHECK(ret < 0, "Could not set number of B Frames");
 	}
 
 
 	if(param->codingType == NV_VIDEO_CodingH264 || param->codingType == NV_VIDEO_CodingHEVC)
 	{
 		ret = ctx->enc->setProfile(ctx->profile);
-		TEST_ERROR(ret < 0, "Could not set encoder profile", ret);
+		ENC_CHECK(ret < 0, "Could not set encoder profile");
 	}
 
 	if(param->codingType== NV_VIDEO_CodingH264)
 	{
 		ret = ctx->enc->setLevel(ctx->level);
-		TEST_ERROR(ret < 0, "Could not set encoder level", ret);
+		ENC_CHECK(ret < 0, "Could not set encoder level");
 	}
 
 
 	if (ctx->enableLossless)
 	{
 		ret = ctx->enc->setConstantQp(0);
-		TEST_ERROR(ret < 0, "Could not set encoder constant qp=0", ret);
+		ENC_CHECK(ret < 0, "Could not set encoder constant qp=0");
 
 	}
 	else
 	{
 		ret = ctx->enc->setRateControlMode(ctx->ratecontrol);
-		TEST_ERROR(ret < 0, "Could not set encoder rate control mode", ret);
+		ENC_CHECK(ret < 0, "Could not set encoder rate control mode");
 
 		if (ctx->ratecontrol == V4L2_MPEG_VIDEO_BITRATE_MODE_VBR)
 		{
@@ -484,32 +508,32 @@ nvmpictx* nvmpi_create_encoder(nvEncParam* param)
 			else
 				peak_bitrate = ctx->peak_bitrate;
 			ret = ctx->enc->setPeakBitrate(peak_bitrate);
-			TEST_ERROR(ret < 0, "Could not set encoder peak bitrate", ret);
+			ENC_CHECK(ret < 0, "Could not set encoder peak bitrate");
 		}
 	}
 
 	ret = ctx->enc->setIDRInterval(ctx->idr_interval);
-	TEST_ERROR(ret < 0, "Could not set encoder IDR interval", ret);
+	ENC_CHECK(ret < 0, "Could not set encoder IDR interval");
 
 	if(ctx->qmax>0 ||ctx->qmin >0){
 		ctx->enc->setQpRange(ctx->qmin, ctx->qmax, ctx->qmin,ctx->qmax, ctx->qmin, ctx->qmax);	
 	}
 	ret = ctx->enc->setIFrameInterval(ctx->iframe_interval);
-	TEST_ERROR(ret < 0, "Could not set encoder I-Frame interval", ret);
+	ENC_CHECK(ret < 0, "Could not set encoder I-Frame interval");
 	
     if(ctx->max_perf)
     {
         /* Enable maximum performance mode by disabling internal DFS logic.
            NOTE: This enables encoder to run at max clocks */
 		ret = ctx->enc->setMaxPerfMode(ctx->max_perf);
-		TEST_ERROR(ret < 0, "Error while setting encoder to max perf", ret);
+		ENC_CHECK(ret < 0, "Error while setting encoder to max perf");
 	}
 	
 	//SPS/PPS insertion is an H.264/HEVC concept, do not apply it to other codecs
 	if(ctx->insert_sps_pps_at_idr &&
 	   (param->codingType==NV_VIDEO_CodingH264 || param->codingType==NV_VIDEO_CodingHEVC)){
 		ret = ctx->enc->setInsertSpsPpsAtIdrEnabled(true);
-		TEST_ERROR(ret < 0, "Could not set insertSPSPPSAtIDR", ret);
+		ENC_CHECK(ret < 0, "Could not set insertSPSPPSAtIDR");
 	}
 
 #ifdef V4L2_CID_MPEG_VIDEOENC_AV1_ERR_RESILIENT_MODE
@@ -517,12 +541,12 @@ nvmpictx* nvmpi_create_encoder(nvEncParam* param)
 	{
 		//the only AV1 control 01_video_encode always sets (default true)
 		ret = ctx->enc->setAV1ErrResilienceMode(true);
-		TEST_ERROR(ret < 0, "Could not set AV1 error resilience mode", ret);
+		ENC_CHECK(ret < 0, "Could not set AV1 error resilience mode");
 	}
 #endif
 
 	ret = ctx->enc->setFrameRate(ctx->fps_n, ctx->fps_d);
-	TEST_ERROR(ret < 0, "Could not set framerate", ret);
+	ENC_CHECK(ret < 0, "Could not set framerate");
 	
 	//ret = ctx->enc->output_plane.setupPlane(V4L2_MEMORY_USERPTR, ctx->packets_num, false, true);
 #if (OUTPLANE_MEMTYPE == OUTPLANE_MEMTYPE_MMAP)
@@ -530,19 +554,19 @@ nvmpictx* nvmpi_create_encoder(nvEncParam* param)
 #else
 	ret = setup_output_dmabuf(ctx,ctx->packets_num); //V4L2_MEMORY_DMABUF
 #endif
-	TEST_ERROR(ret < 0, "Could not setup output plane", ret);
+	ENC_CHECK(ret < 0, "Could not setup output plane");
 
 	ret = ctx->enc->capture_plane.setupPlane(V4L2_MEMORY_MMAP, ctx->packets_num, true, false);
-	TEST_ERROR(ret < 0, "Could not setup capture plane", ret);
+	ENC_CHECK(ret < 0, "Could not setup capture plane");
 
 	ret = ctx->enc->subscribeEvent(V4L2_EVENT_EOS,0,0);
-	TEST_ERROR(ret < 0, "Could not subscribe EOS event", ret);
+	ENC_CHECK(ret < 0, "Could not subscribe EOS event");
 
 	ret = ctx->enc->output_plane.setStreamStatus(true);
-	TEST_ERROR(ret < 0, "Error in output plane streamon", ret);
+	ENC_CHECK(ret < 0, "Error in output plane streamon");
 
 	ret = ctx->enc->capture_plane.setStreamStatus(true);
-	TEST_ERROR(ret < 0, "Error in capture plane streamon", ret);
+	ENC_CHECK(ret < 0, "Error in capture plane streamon");
 
 	if(ctx->blocking_mode)
 	{
@@ -573,7 +597,7 @@ nvmpictx* nvmpi_create_encoder(nvEncParam* param)
 		v4l2_buf.m.planes = planes;
 
 		ret = ctx->enc->capture_plane.qBuffer(v4l2_buf, NULL);
-		TEST_ERROR(ret < 0, "Error while queueing buffer at capture plane", ret);
+		ENC_CHECK(ret < 0, "Error while queueing buffer at capture plane");
 
 	}
 
@@ -744,6 +768,7 @@ int nvmpi_encoder_get_packet(nvmpictx* ctx,nvPacket** packet)
 
 int nvmpi_encoder_close(nvmpictx* ctx)
 {
+	if(!ctx) return -1;
 	if(ctx->blocking_mode)
 	{
 		//release a DQ callback blocked in the backpressure wait; stopDQThread

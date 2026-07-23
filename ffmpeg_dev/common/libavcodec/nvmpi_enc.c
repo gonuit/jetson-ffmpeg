@@ -278,13 +278,24 @@ static av_cold int nvmpi_encode_init(AVCodecContext *avctx)
 		if(avctx->codec->id == AV_CODEC_ID_H264) param.codingType = NV_VIDEO_CodingH264;
 		else if(avctx->codec->id == AV_CODEC_ID_AV1) param.codingType = NV_VIDEO_CodingAV1;
 		else param.codingType = NV_VIDEO_CodingHEVC;
-		av_image_alloc(dst, linesize,avctx->width,avctx->height,avctx->pix_fmt,1);
+		ret = av_image_alloc(dst, linesize,avctx->width,avctx->height,avctx->pix_fmt,1);
+		if(ret < 0)
+		{
+			av_frame_free(&nvmpi_context->frame);
+			return ret;
+		}
 
 		int saved_stdout = nvmpi_shadow_stdout();
 		nvmpi_context->ctx = nvmpi_create_encoder(&param);
 		nvmpi_restore_stdout(saved_stdout);
 		_ctx = nvmpi_context->ctx;
-		//TODO error handling. if(!_ctx)
+		if(!_ctx)
+		{
+			av_freep(&dst[0]);
+			av_frame_free(&nvmpi_context->frame);
+			av_log(avctx, AV_LOG_ERROR, "failed to create the nvmpi encoder (is the codec hardware available?)\n");
+			return AVERROR_EXTERNAL;
+		}
 		nvmpienc_initPktPool(avctx,nvmpi_context->packet_pool_size);
 		i=0;
 		_nvframe.timestamp=0;
@@ -405,12 +416,14 @@ static av_cold int nvmpi_encode_init(AVCodecContext *avctx)
 	}
 	//else TODO
 	nvmpi_restore_stdout(saved_stdout);
-	
-	if(nvmpi_context->ctx)
+
+	if(!nvmpi_context->ctx)
 	{
-		nvmpienc_initPktPool(avctx,nvmpi_context->packet_pool_size);
+		av_frame_free(&nvmpi_context->frame);
+		av_log(avctx, AV_LOG_ERROR, "failed to create the nvmpi encoder (is the codec hardware available?)\n");
+		return AVERROR_EXTERNAL;
 	}
-	//TODO error handling. if(!nvmpi_context->ctx)
+	nvmpienc_initPktPool(avctx,nvmpi_context->packet_pool_size);
 
 	return 0;
 }
@@ -551,7 +564,13 @@ static int ff_nvmpi_receive_packet_async(AVCodecContext *avctx, AVPacket *pkt)
 static av_cold int nvmpi_encode_close(AVCodecContext *avctx)
 {
 	nvmpiEncodeContext *nvmpi_context = avctx->priv_data;
-	
+
+	if(!nvmpi_context->ctx)
+	{
+		av_frame_free(&nvmpi_context->frame);
+		return 0;
+	}
+
 	//drain encoder
 	{
 		int ret;
