@@ -340,7 +340,7 @@ static av_cold int nvmpi_encode_init(AVCodecContext *avctx)
 			else
 			{
 			//find idr index
-			while(i<nPkt->payload_size)
+			while(i + 4 < nPkt->payload_size)
 			{
 				//check if nal start code
 				if(nPkt->payload[i] == 0 && nPkt->payload[i+1] == 0 && nPkt->payload[i+2] == 0 && nPkt->payload[i+3] == 0x01)
@@ -359,10 +359,17 @@ static av_cold int nvmpi_encode_init(AVCodecContext *avctx)
 				i++;
 			}
 
+			if(i + 4 >= nPkt->payload_size)
+			{
+				av_log(avctx, AV_LOG_WARNING, "no IDR NAL in first encoded packet, extradata not set\n");
+			}
+			else
+			{
 			avctx->extradata_size=i;
 			avctx->extradata	= av_mallocz( avctx->extradata_size + AV_INPUT_BUFFER_PADDING_SIZE );
 			memcpy( avctx->extradata, nPkt->payload,avctx->extradata_size);
 			memset( avctx->extradata + avctx->extradata_size, 0, AV_INPUT_BUFFER_PADDING_SIZE );
+			}
 			}
 			
 			nvmpienc_nvPacket_free(nPkt);
