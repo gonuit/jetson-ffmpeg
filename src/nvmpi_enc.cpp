@@ -13,7 +13,7 @@
 #define TEST_ERROR(condition, message, errorCode)    \
 	if (condition)                               \
 {                                                    \
-	std::cout<< message;                         \
+	std::cerr<< message;                         \
 }
 
 #define OUTPLANE_MEMTYPE_MMAP 0
@@ -67,14 +67,14 @@ static bool encoder_capture_plane_dq_callback(struct v4l2_buffer *v4l2_buf, NvBu
 
 	if (v4l2_buf == NULL)
 	{
-		cout << "Error while dequeing buffer from output plane" << endl;
+		cerr << "Error while dequeing buffer from output plane" << endl;
 		return false;
 	}
 
 	if (buffer->planes[0].bytesused == 0)
 	{
 		ctx->capPlaneGotEOS = true;
-		//cout << "Got 0 size buffer in capture \n"; //TODO  log it
+		//cerr << "Got 0 size buffer in capture \n"; //TODO  log it
 		return false;
 	}
 	
@@ -88,7 +88,7 @@ static bool encoder_capture_plane_dq_callback(struct v4l2_buffer *v4l2_buf, NvBu
 	{
 		//TODO wait for user to read buffer. make send_frame return AVERROR(EAGAIN) until avcodec_receive_packet() is called
 		//TODO pass warning to avlog
-		printf("[libnvmpi][W]: EAGAIN. User must read output. nvmpi encoder packet memory pool is empty! Packet will be dropped. There may be artifacts in the output video.\n");
+		fprintf(stderr, "[libnvmpi][W]: EAGAIN. User must read output. nvmpi encoder packet memory pool is empty! Packet will be dropped. There may be artifacts in the output video.\n");
 	}
 	else
 	{
@@ -529,7 +529,7 @@ nvmpictx* nvmpi_create_encoder(nvEncParam* param)
         // Set encoder poll thread for non-blocking io mode
         pthread_create(&ctx->enc_pollthread, NULL, encoder_pollthread_fcn, ctx);
         pthread_setname_np(ctx->enc_pollthread, "EncPollThread");
-        cout << "Created the PollThread and Encoder Thread \n";
+        cerr << "Created the PollThread and Encoder Thread \n";
         */
     }
 
@@ -618,7 +618,7 @@ int nvmpi_encoder_put_frame(nvmpictx* ctx,nvFrame* frame)
 		ret = ctx->enc->output_plane.dqBuffer(v4l2_buf, &nvBuffer, NULL, -1);
 		if (ret < 0)
 		{
-			cout << "Error DQing buffer at output plane" << std::endl;
+			cerr << "Error DQing buffer at output plane" << std::endl;
 			return false;
 		}
 	}

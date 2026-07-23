@@ -2,6 +2,7 @@
 #include "avcodec.h"
 #include "internal.h"
 #include <stdio.h>
+#include <unistd.h>
 #include "libavutil/avstring.h"
 #include "libavutil/avutil.h"
 #include "libavutil/common.h"
@@ -30,6 +31,26 @@
 #endif
 
 static const AVRational NVENC_TIMEBASE = {1, 1000000};
+
+//the closed-source nv v4l2 plugin prints a banner to stdout when the encoder
+//device is opened, which corrupts piped output (-f mp4 pipe:1). Shadow stdout
+//with stderr while the device is created.
+static int nvmpi_shadow_stdout(void)
+{
+	int fd;
+	fflush(stdout);
+	fd = dup(1);
+	if(fd >= 0) dup2(2, 1);
+	return fd;
+}
+
+static void nvmpi_restore_stdout(int fd)
+{
+	if(fd < 0) return;
+	fflush(stdout);
+	dup2(fd, 1);
+	close(fd);
+}
 
 #define OPT_packet_pool_size_MIN 1
 #define OPT_packet_pool_size_MAX 32
@@ -259,7 +280,9 @@ static av_cold int nvmpi_encode_init(AVCodecContext *avctx)
 		else param.codingType = NV_VIDEO_CodingHEVC;
 		av_image_alloc(dst, linesize,avctx->width,avctx->height,avctx->pix_fmt,1);
 
+		int saved_stdout = nvmpi_shadow_stdout();
 		nvmpi_context->ctx = nvmpi_create_encoder(&param);
+		nvmpi_restore_stdout(saved_stdout);
 		_ctx = nvmpi_context->ctx;
 		//TODO error handling. if(!_ctx)
 		nvmpienc_initPktPool(avctx,nvmpi_context->packet_pool_size);
@@ -363,6 +386,7 @@ static av_cold int nvmpi_encode_init(AVCodecContext *avctx)
 		nvmpi_context->ctx = NULL;
 	}
 
+	int saved_stdout = nvmpi_shadow_stdout();
 	if(avctx->codec->id == AV_CODEC_ID_H264)
 	{
 		param.codingType = NV_VIDEO_CodingH264;
@@ -379,6 +403,7 @@ static av_cold int nvmpi_encode_init(AVCodecContext *avctx)
 		nvmpi_context->ctx=nvmpi_create_encoder(&param);
 	}
 	//else TODO
+	nvmpi_restore_stdout(saved_stdout);
 	
 	if(nvmpi_context->ctx)
 	{

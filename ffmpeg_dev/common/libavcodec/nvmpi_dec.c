@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/time.h>
+#include <unistd.h>
 
 #include <nvmpi.h>
 #include "avcodec.h"
@@ -34,6 +35,26 @@ typedef struct {
 	int frame_pool_size;
 	char eos_reached;
 } nvmpiDecodeContext;
+
+//the closed-source nv v4l2 plugin prints a banner to stdout when the decoder
+//device is opened, which corrupts piped output (-f rawvideo pipe:1). Shadow
+//stdout with stderr while the device is created.
+static int nvmpi_shadow_stdout(void)
+{
+	int fd;
+	fflush(stdout);
+	fd = dup(1);
+	if(fd >= 0) dup2(2, 1);
+	return fd;
+}
+
+static void nvmpi_restore_stdout(int fd)
+{
+	if(fd < 0) return;
+	fflush(stdout);
+	dup2(fd, 1);
+	close(fd);
+}
 
 static nvCodingType nvmpi_get_codingtype(AVCodecContext *avctx)
 {
@@ -116,7 +137,9 @@ static int nvmpi_init_decoder(AVCodecContext *avctx)
 		return AVERROR(ENOMEM);
 	}
 
+	int saved_stdout = nvmpi_shadow_stdout();
 	nvmpi_context->ctx=nvmpi_create_decoder(&param);
+	nvmpi_restore_stdout(saved_stdout);
 
 	if(!nvmpi_context->ctx)
 	{
