@@ -71,14 +71,23 @@ static int nvmpi_init_decoder(AVCodecContext *avctx)
 	if(avctx->pix_fmt ==AV_PIX_FMT_NONE)
 	{
 		 avctx->pix_fmt=AV_PIX_FMT_YUV420P;
+		 param.pixFormat = NV_PIX_YUV420;
+	}
+	else if(avctx->pix_fmt == AV_PIX_FMT_YUV420P10LE || avctx->pix_fmt == AV_PIX_FMT_P010LE)
+	{
+		//10-bit stream (HEVC Main 10 / VP9 profile 2): decode to P010
+		avctx->pix_fmt = AV_PIX_FMT_P010LE;
+		param.pixFormat = NV_PIX_P010;
 	}
 	else if((avctx->pix_fmt != AV_PIX_FMT_YUV420P) && (avctx->pix_fmt != AV_PIX_FMT_YUVJ420P))
 	{
-		av_log(avctx, AV_LOG_ERROR, "Invalid Pix_FMT for NVMPI: Only YUV420P and YUVJ420P are supported\n");
+		av_log(avctx, AV_LOG_ERROR, "Invalid Pix_FMT for NVMPI: Only YUV420P, YUVJ420P and 10-bit (P010) input are supported\n");
 		return AVERROR_INVALIDDATA;
 	}
-	//TODO more pixformats support
-	param.pixFormat = NV_PIX_YUV420;
+	else
+	{
+		param.pixFormat = NV_PIX_YUV420;
+	}
 
     if (nvmpi_context->resize_expr && sscanf(nvmpi_context->resize_expr, "%dx%d",
                                              &param.resized.width, &param.resized.height) != 2)
@@ -173,7 +182,7 @@ static int nvmpi_decode(AVCodecContext *avctx, void *data, int *got_frame, AVPac
 		return decode_ret;
 	}
 
-	bufFrame->format=AV_PIX_FMT_YUV420P;
+	bufFrame->format=avctx->pix_fmt;
 	bufFrame->pts=_nvframe.timestamp;
 	bufFrame->pkt_dts = AV_NOPTS_VALUE;
 	av_frame_move_ref(frame, bufFrame);
@@ -225,7 +234,7 @@ static const AVOption options[] = {
 			FF_CODEC_DECODE_CB(nvmpi_decode), \
 			.p.priv_class     = &nvmpi_##NAME##_dec_class, \
 			.p.capabilities   = AV_CODEC_CAP_DELAY | AV_CODEC_CAP_AVOID_PROBING | AV_CODEC_CAP_HARDWARE, \
-			.p.pix_fmts	=(const enum AVPixelFormat[]){AV_PIX_FMT_YUV420P,AV_PIX_FMT_NV12,AV_PIX_FMT_NONE},\
+			.p.pix_fmts	=(const enum AVPixelFormat[]){AV_PIX_FMT_YUV420P,AV_PIX_FMT_NV12,AV_PIX_FMT_P010LE,AV_PIX_FMT_NONE},\
 			.bsfs           = BSFS, \
 			.p.wrapper_name   = "nvmpi", \
 		};
@@ -243,7 +252,7 @@ static const AVOption options[] = {
 			.decode         = nvmpi_decode, \
 			.priv_class     = &nvmpi_##NAME##_dec_class, \
 			.capabilities   = AV_CODEC_CAP_DELAY | AV_CODEC_CAP_AVOID_PROBING | AV_CODEC_CAP_HARDWARE, \
-			.pix_fmts	=(const enum AVPixelFormat[]){AV_PIX_FMT_YUV420P,AV_PIX_FMT_NV12,AV_PIX_FMT_NONE},\
+			.pix_fmts	=(const enum AVPixelFormat[]){AV_PIX_FMT_YUV420P,AV_PIX_FMT_NV12,AV_PIX_FMT_P010LE,AV_PIX_FMT_NONE},\
 			.bsfs           = BSFS, \
 			.wrapper_name   = "nvmpi", \
 		};

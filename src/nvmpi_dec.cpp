@@ -75,7 +75,13 @@ struct nvmpictx
 
 NvBufferColorFormat getNvColorFormatFromV4l2Format(v4l2_format &format)
 {
-	NvBufferColorFormat ret_cf = NvBufferColorFormat_NV12; 
+	NvBufferColorFormat ret_cf = NvBufferColorFormat_NV12;
+#ifdef V4L2_PIX_FMT_P010M
+	//10-bit stream: the driver reports P010M on the capture plane.
+	//Same unconditional mapping as 00_video_decode (video_decode_main.cpp:696-697).
+	if (format.fmt.pix_mp.pixelformat == V4L2_PIX_FMT_P010M)
+		return NvBufferColorFormat_NV12_10LE;
+#endif
 	switch (format.fmt.pix_mp.colorspace)
 	{
 		case V4L2_COLORSPACE_SMPTE170M:
@@ -236,7 +242,13 @@ void nvmpictx::updateFrameSizeParams()
 #ifdef WITH_NVUTILS
 		frame_linedatasize[i] = parm.width[i] * parm.bytesPerPix[i]; //valid only for nvutils
 #else
-		if(i == 1 && (parm.pixel_format == NvBufferColorFormat_NV12 ||
+		if(parm.pixel_format == NvBufferColorFormat_NV12_10LE)
+		{
+			//16 bits per component: luma rows are width*2 bytes, interleaved
+			//chroma rows are width*4 bytes (width is in chroma pairs)
+			frame_linedatasize[i] = parm.width[i] * (i == 1 ? 4 : 2);
+		}
+		else if(i == 1 && (parm.pixel_format == NvBufferColorFormat_NV12 ||
 				parm.pixel_format == NvBufferColorFormat_NV16 ||
 				parm.pixel_format == NvBufferColorFormat_NV24 ||
 				parm.pixel_format == NvBufferColorFormat_NV12_ER ||
@@ -305,6 +317,7 @@ void nvmpictx::initFramePool()
 {
 	//if(bufNumber <= 0) return false; //TODO log msg //TODO check if it's already allocated and deinit first
 	NvBufferColorFormat cFmt = out_pixfmt==NV_PIX_NV12?NvBufferColorFormat_NV12: NvBufferColorFormat_YUV420;
+	if(out_pixfmt==NV_PIX_P010) cFmt = NvBufferColorFormat_NV12_10LE;
 	
 	NvBufferCreateParams input_params;
 	memset(&input_params, 0, sizeof(input_params));
