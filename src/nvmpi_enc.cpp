@@ -63,6 +63,15 @@ struct nvmpictx
 	NvVideoEncoder *enc;
 	NVMPI_bufPool<nvPacket*>* pktPool;
 	int *output_plane_fd; //array to store dmabuf fd's
+
+	//zero-copy dmabuf input (V4L2_MEMORY_DMABUF output plane)
+	bool dmabuf_input;
+	int lastDmabufFd;
+#ifdef WITH_NVUTILS
+	//fds registered via NvBufSurfaceImport: the V4L2 backend resolves queued
+	//fds with NvBufSurfaceFromFd, which only knows registered buffers
+	std::vector<int> importedFds;
+#endif
 };
 
 
@@ -70,7 +79,8 @@ static bool encoder_capture_plane_dq_callback(struct v4l2_buffer *v4l2_buf, NvBu
 {
 	nvmpictx *ctx = (nvmpictx*)arg;
 
-	if (v4l2_buf == NULL)
+	//the v4l2 backend can deliver a NULL buffer during STREAMOFF teardown
+	if (v4l2_buf == NULL || buffer == NULL)
 	{
 		cerr << "Error while dequeing buffer from output plane" << endl;
 		ctx->dqThreadRunning = false;
@@ -273,6 +283,8 @@ nvmpictx* nvmpi_create_encoder(nvEncParam* param)
 	ctx->flushing = false;
 	ctx->enc_shutdown = false;
 	ctx->dqThreadRunning = false;
+	ctx->dmabuf_input = false;
+	ctx->lastDmabufFd = -1;
 	ctx->blocking_mode = true; //TODO non-blocking mode support
 	ctx->max_perf = true; //TODO invistigate why encoder is slow without max_perf even with MAXN power mode
 	ctx->vbv_buffer_size = param->vbv_buffer_size;
@@ -437,6 +449,18 @@ nvmpictx* nvmpi_create_encoder(nvEncParam* param)
 		ctx->raw_pixfmt = V4L2_PIX_FMT_P010M;
 	}
 
+	//zero-copy dmabuf input: raw frames are external NV12 surfaces queued by fd
+	if(param->useDmabufInput)
+	{
+#ifndef WITH_NVUTILS
+		ENC_CHECK(true, "dmabuf input requires the nvbufsurface API (JetPack 5+)");
+#endif
+		ENC_CHECK(ctx->raw_pixfmt == V4L2_PIX_FMT_P010M, "dmabuf input supports 8-bit NV12 only");
+		ENC_CHECK(ctx->enableLossless, "dmabuf input is incompatible with lossless YUV444");
+		ctx->dmabuf_input = true;
+		ctx->raw_pixfmt = V4L2_PIX_FMT_NV12M;
+	}
+
 	if (ctx->enableLossless && param->codingType == NV_VIDEO_CodingH264)
 	{
 		ctx->profile = V4L2_MPEG_VIDEO_H264_PROFILE_HIGH_444_PREDICTIVE;
@@ -549,11 +573,19 @@ nvmpictx* nvmpi_create_encoder(nvEncParam* param)
 	ENC_CHECK(ret < 0, "Could not set framerate");
 	
 	//ret = ctx->enc->output_plane.setupPlane(V4L2_MEMORY_USERPTR, ctx->packets_num, false, true);
+	if(ctx->dmabuf_input)
+	{
+		//buffers are external dmabufs supplied per-frame via put_dmabuf
+		ret = ctx->enc->output_plane.setupPlane(V4L2_MEMORY_DMABUF, ctx->packets_num, false, false);
+	}
+	else
+	{
 #if (OUTPLANE_MEMTYPE == OUTPLANE_MEMTYPE_MMAP)
 	ret = ctx->enc->output_plane.setupPlane(V4L2_MEMORY_MMAP, ctx->packets_num, true, false);
 #else
 	ret = setup_output_dmabuf(ctx,ctx->packets_num); //V4L2_MEMORY_DMABUF
 #endif
+	}
 	ENC_CHECK(ret < 0, "Could not setup output plane");
 
 	ret = ctx->enc->capture_plane.setupPlane(V4L2_MEMORY_MMAP, ctx->packets_num, true, false);
@@ -628,8 +660,152 @@ int copyFrameToNvBuf(nvFrame* frame, NvBuffer& buffer)
 	return 0;
 }
 
+#ifdef WITH_NVUTILS
+//register a foreign dmabuf so NvBufSurfaceFromFd resolves it. libnvbufsurface
+//can crash on invalid import params, so all known constraints are checked first.
+static int nvmpi_enc_register_dmabuf(nvmpictx* ctx, nvDmaBufFrame* frame)
+{
+	for(size_t i=0; i<ctx->importedFds.size(); i++)
+		if(ctx->importedFds[i] == frame->fd) return 0;
+
+	if(frame->num_planes != 2)
+	{
+		cerr << "nvmpi: dmabuf import expects 2-plane NV12, got " << frame->num_planes << " planes" << endl;
+		return -1;
+	}
+	for(unsigned int i=0; i<frame->num_planes; i++)
+	{
+		if(frame->pitch[i] % 256)
+		{
+			cerr << "nvmpi: dmabuf plane " << i << " pitch " << frame->pitch[i]
+				<< " is not a multiple of 256 (NVENC surface import constraint)" << endl;
+			return -1;
+		}
+		if((unsigned long)frame->offset[i] + frame->psize[i] > frame->totalSize)
+		{
+			cerr << "nvmpi: dmabuf plane " << i << " exceeds the buffer size" << endl;
+			return -1;
+		}
+	}
+
+	NvBufSurfaceMapParams mp;
+	memset(&mp, 0, sizeof(mp));
+	mp.num_planes = frame->num_planes;
+	mp.fd = frame->fd;
+	mp.totalSize = frame->totalSize;
+	mp.memType = NVBUF_MEM_SURFACE_ARRAY;
+	mp.layout = NVBUF_LAYOUT_PITCH;
+	mp.colorFormat = NVBUF_COLOR_FORMAT_NV12;
+	for(unsigned int i=0; i<frame->num_planes; i++)
+	{
+		mp.planes[i].width = frame->width[i];
+		mp.planes[i].height = frame->height[i];
+		mp.planes[i].pitch = frame->pitch[i];
+		mp.planes[i].offset = frame->offset[i];
+		mp.planes[i].psize = frame->psize[i];
+		//native surfaces report this flag in NvBufSurfaceGetMapParams
+		mp.planes[i].flags = 0x8000000000000000ULL;
+	}
+
+	NvBufSurface* surf = NULL;
+	if(NvBufSurfaceImport(&surf, &mp) != 0 || !surf)
+	{
+		cerr << "nvmpi: NvBufSurfaceImport failed for dmabuf fd " << frame->fd << endl;
+		return -1;
+	}
+	ctx->importedFds.push_back(frame->fd);
+	return 0;
+}
+#endif
+
+int nvmpi_encoder_put_dmabuf(nvmpictx* ctx, nvDmaBufFrame* frame)
+{
+#ifndef WITH_NVUTILS
+	(void)frame;
+	cerr << "nvmpi: dmabuf input requires the nvbufsurface API" << endl;
+	return -1;
+#else
+	if(!ctx || !ctx->dmabuf_input) return -1;
+	if(ctx->flushing) return -2;
+
+	int ret;
+	struct v4l2_buffer v4l2_buf;
+	struct v4l2_plane planes[MAX_PLANES];
+	NvBuffer *nvBuffer;
+
+	memset(&v4l2_buf, 0, sizeof(v4l2_buf));
+	memset(planes, 0, sizeof(planes));
+	v4l2_buf.m.planes = planes;
+
+	if(ctx->enc->isInError())
+		return -1;
+
+	if(frame)
+	{
+		//validate + import before claiming a V4L2 buffer slot
+		if(nvmpi_enc_register_dmabuf(ctx, frame) < 0) return -1;
+	}
+	else if(ctx->lastDmabufFd < 0)
+	{
+		//flush before any frame: no fd for an EOS buffer. Streamoff wakes the
+		//DQ thread (parked in DQBUF) so close() can join it instead of racing
+		//the buffer teardown in ~NvVideoEncoder.
+		ctx->flushing = true;
+		ctx->capPlaneGotEOS = true;
+		ctx->enc->capture_plane.setStreamStatus(false);
+		return 0;
+	}
+
+	if(ctx->index < ctx->enc->output_plane.getNumBuffers())
+	{
+		nvBuffer = ctx->enc->output_plane.getNthBuffer(ctx->index);
+		v4l2_buf.index = ctx->index;
+		ctx->index++;
+	}
+	else
+	{
+		ret = ctx->enc->output_plane.dqBuffer(v4l2_buf, &nvBuffer, NULL, -1);
+		if(ret < 0)
+		{
+			cerr << "Error DQing buffer at output plane" << std::endl;
+			return -1;
+		}
+	}
+
+	if(frame)
+	{
+		for(uint32_t j = 0; j < nvBuffer->n_planes; j++)
+		{
+			v4l2_buf.m.planes[j].m.fd = frame->fd;
+			v4l2_buf.m.planes[j].bytesused = frame->pitch[j] * frame->height[j];
+		}
+		ctx->lastDmabufFd = frame->fd;
+		v4l2_buf.flags |= V4L2_BUF_FLAG_TIMESTAMP_COPY;
+		v4l2_buf.timestamp.tv_usec = frame->timestamp % 1000000;
+		v4l2_buf.timestamp.tv_sec = frame->timestamp / 1000000;
+	}
+	else
+	{
+		//send EOS and flush; DMABUF planes still need a resolvable fd
+		ctx->flushing = true;
+		for(uint32_t j = 0; j < nvBuffer->n_planes; j++)
+		{
+			v4l2_buf.m.planes[j].m.fd = ctx->lastDmabufFd;
+			v4l2_buf.m.planes[j].bytesused = 0;
+		}
+	}
+
+	ret = ctx->enc->output_plane.qBuffer(v4l2_buf, NULL);
+	TEST_ERROR(ret < 0, "Error while queueing buffer at output plane", ret);
+
+	return 0;
+#endif
+}
+
 int nvmpi_encoder_put_frame(nvmpictx* ctx,nvFrame* frame)
 {
+	//in dmabuf mode the CPU copy path is invalid; EOS is delegated
+	if(ctx->dmabuf_input) return frame ? -1 : nvmpi_encoder_put_dmabuf(ctx, NULL);
 	if(ctx->flushing) return -2;
 	
 	int ret;
@@ -777,7 +953,14 @@ int nvmpi_encoder_close(nvmpictx* ctx)
 		ctx->enc_shutdown = true;
 		ctx->enc->capture_plane.stopDQThread();
 		if(ctx->enc->capture_plane.waitForDQThread(1000) < 0)
+		{
 			cerr << "[libnvmpi][W]: encoder DQ thread did not stop within 1s" << endl;
+			//thread parked in DQBUF (no EOS reached the capture plane);
+			//streamoff makes the blocked DQBUF return so it can exit
+			ctx->enc->capture_plane.setStreamStatus(false);
+			if(ctx->enc->capture_plane.waitForDQThread(3000) < 0)
+				cerr << "[libnvmpi][W]: encoder DQ thread still running after streamoff" << endl;
+		}
 	}
 	else
 	{
@@ -812,6 +995,11 @@ int nvmpi_encoder_close(nvmpictx* ctx)
 	
 	delete ctx->enc;
 	delete ctx->pktPool;
+#ifdef WITH_NVUTILS
+	//drop the references NvBufSurfaceImport added; the fds stay the producer's
+	for(size_t i=0; i<ctx->importedFds.size(); i++)
+		NvBufferDestroy(ctx->importedFds[i]);
+#endif
 	delete ctx;
 	return 0;
 }

@@ -269,6 +269,34 @@ cp "$BKP_FILE_LIBAVCODEC_ALLCODECSC" "$FF_FILE_LIBAVCODEC_ALLCODECSC"
 cp ffmpeg_dev/common/libavcodec/nvmpi_dec.c ${FF_DIR_LIBAVCODEC}"/nvmpi_dec.c"
 cp ffmpeg_dev/common/libavcodec/nvmpi_enc.c ${FF_DIR_LIBAVCODEC}"/nvmpi_enc.c"
 
+#hwcontext_vulkan: fill the DRM plane layout for LINEAR images when the driver
+#reports none (Tegra) - lets vulkan frames hwmap to drm_prime for zero-copy
+#encode. Skipped when the anchor is absent (older ffmpeg) or already applied.
+FF_FILE_HWCONTEXT_VULKAN=${FF_DIR_ROOT}"/libavutil/hwcontext_vulkan.c"
+if [ -f "$FF_FILE_HWCONTEXT_VULKAN" ] && grep -q 'drm_desc->layers\[i\].format == DRM_FORMAT_INVALID' "$FF_FILE_HWCONTEXT_VULKAN"; then
+	if grep -q 'nvmpi: linear-layout fallback' "$FF_FILE_HWCONTEXT_VULKAN"; then
+		echo "$FF_FILE_HWCONTEXT_VULKAN already patched"
+	else
+		awk -v insfile="ffmpeg_dev/common/libavutil/nvmpi_vulkan_linear_fallback.inc" '
+			/if \(drm_desc->layers\[i\]\.format == DRM_FORMAT_INVALID\)/ && !done {
+				while ((getline line < insfile) > 0) print line
+				close(insfile)
+				done=1
+			}
+			{ print }
+		' "$FF_FILE_HWCONTEXT_VULKAN" > "$FF_FILE_HWCONTEXT_VULKAN.nvmpi.tmp" && \
+		mv "$FF_FILE_HWCONTEXT_VULKAN.nvmpi.tmp" "$FF_FILE_HWCONTEXT_VULKAN"
+		if grep -q 'nvmpi: linear-layout fallback' "$FF_FILE_HWCONTEXT_VULKAN"; then
+			echo "$FF_FILE_HWCONTEXT_VULKAN is successfully patched!"
+		else
+			echo "Patching $FF_FILE_HWCONTEXT_VULKAN failed!"
+			exit 1
+		fi
+	fi
+else
+	echo "[I]: hwcontext_vulkan linear-layout fallback skipped (anchor not found)"
+fi
+
 echo "Success!"
 
 rm -rf "$BKP_DIR" 2>&1 > /dev/null

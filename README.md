@@ -118,3 +118,14 @@ last — so `-resize 1280x720 -rotate 90` produces a 720x1280 output.
 **Transcode h264 to h265 video example**
 
     ffmpeg -c:v h264_nvmpi -i <input.mp4> -c:v hevc_nvmpi <output.mp4>
+
+**Zero-copy encoder input from Vulkan / DRM PRIME (ffmpeg 8+, API)**
+
+The encoders accept `AV_PIX_FMT_DRM_PRIME` frames and queue the dmabuf
+directly on the V4L2 output plane. Vulkan: linear NV12 image
+(`tiling = VK_IMAGE_TILING_LINEAR` on the frames context), mapped per frame
+with `av_hwframe_map()` to drm_prime; non-ffmpeg users:
+`nvmpi_encoder_put_dmabuf()`. Constraints: 8-bit NV12, single dmabuf object,
+pitch-linear with 256-aligned pitch (Tegra linear pitch == width), descriptor
+must carry the plane layout. Keep a frame's dmabuf untouched until its buffer
+slot recycles (the ffmpeg wrapper holds frame refs that long).

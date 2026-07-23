@@ -28,6 +28,10 @@
 #endif
 #if (LIBAVCODEC_VERSION_MAJOR >= 60)
 #include "codec_internal.h"
+#include "hwconfig.h"
+#include "libavutil/hwcontext.h"
+#include "libavutil/hwcontext_drm.h"
+#define NVMPI_DRM_PRIME_INPUT
 #endif
 
 static const AVRational NVENC_TIMEBASE = {1, 1000000};
@@ -67,6 +71,11 @@ typedef struct {
 	int preset;
 	int encoder_flushing;
 	AVFrame *frame; //tmp frame
+	//drm_prime input: refs held while frames sit queued in V4L2
+	int hw_input;
+	AVFrame **held_frames;
+	int held_count;
+	int held_pos;
 }nvmpiEncodeContext;
 
 nvPacket* nvmpienc_nvPacket_alloc(AVCodecContext *avctx, int bufSize);
@@ -229,7 +238,30 @@ static av_cold int nvmpi_encode_init(AVCodecContext *avctx)
 	param.insert_spspps_idr=(avctx->flags & AV_CODEC_FLAG_GLOBAL_HEADER)?0:1;
 	//10-bit input (HEVC only -> Main 10); everything else feeds 8-bit yuv420p
 	param.inputPixFormat=(avctx->pix_fmt == AV_PIX_FMT_P010LE)?NV_PIX_P010:NV_PIX_YUV420;
-	
+
+#ifdef NVMPI_DRM_PRIME_INPUT
+	nvmpi_context->hw_input = (avctx->pix_fmt == AV_PIX_FMT_DRM_PRIME);
+	if(nvmpi_context->hw_input)
+	{
+		if(avctx->hw_frames_ctx)
+		{
+			AVHWFramesContext *hwf = (AVHWFramesContext*)avctx->hw_frames_ctx->data;
+			if(hwf->sw_format != AV_PIX_FMT_NV12)
+			{
+				av_log(avctx, AV_LOG_ERROR, "drm_prime input must carry NV12, got %s\n",
+					av_get_pix_fmt_name(hwf->sw_format));
+				return AVERROR(EINVAL);
+			}
+		}
+		param.useDmabufInput = 1;
+		param.inputPixFormat = NV_PIX_NV12;
+		//frames stay queued in V4L2 until their buffer slot recycles
+		nvmpi_context->held_count = nvmpi_context->num_capture_buffers + 2;
+		nvmpi_context->held_frames = av_calloc(nvmpi_context->held_count, sizeof(AVFrame*));
+		if(!nvmpi_context->held_frames) return AVERROR(ENOMEM);
+	}
+#endif
+
 	nvmpi_context->frame = av_frame_alloc();
 	if (!nvmpi_context->frame) return AVERROR(ENOMEM);
 
@@ -278,7 +310,17 @@ static av_cold int nvmpi_encode_init(AVCodecContext *avctx)
 		if(avctx->codec->id == AV_CODEC_ID_H264) param.codingType = NV_VIDEO_CodingH264;
 		else if(avctx->codec->id == AV_CODEC_ID_AV1) param.codingType = NV_VIDEO_CodingAV1;
 		else param.codingType = NV_VIDEO_CodingHEVC;
-		ret = av_image_alloc(dst, linesize,avctx->width,avctx->height,avctx->pix_fmt,1);
+		//the pre-run feeds dummy CPU frames; with drm_prime input the
+		//throwaway encoder runs in CPU mode (extradata is identical)
+		enum AVPixelFormat dummyFmt = avctx->pix_fmt;
+		char savedDmabufInput = param.useDmabufInput;
+		if(nvmpi_context->hw_input)
+		{
+			dummyFmt = AV_PIX_FMT_YUV420P;
+			param.useDmabufInput = 0;
+			param.inputPixFormat = NV_PIX_YUV420;
+		}
+		ret = av_image_alloc(dst, linesize,avctx->width,avctx->height,dummyFmt,1);
 		if(ret < 0)
 		{
 			av_frame_free(&nvmpi_context->frame);
@@ -403,6 +445,12 @@ static av_cold int nvmpi_encode_init(AVCodecContext *avctx)
 		nvmpienc_deinitPktPool(avctx);
 		nvmpi_encoder_close(nvmpi_context->ctx);
 		nvmpi_context->ctx = NULL;
+
+		if(nvmpi_context->hw_input)
+		{
+			param.useDmabufInput = savedDmabufInput;
+			param.inputPixFormat = NV_PIX_NV12;
+		}
 	}
 
 	int saved_stdout = nvmpi_shadow_stdout();
@@ -435,6 +483,76 @@ static av_cold int nvmpi_encode_init(AVCodecContext *avctx)
 	return 0;
 }
 
+#ifdef NVMPI_DRM_PRIME_INPUT
+//zero-copy: hand the frame's dmabuf fd to the encoder. Needs a single-object
+//descriptor with plane layout; the HW requires 256-aligned pitches to import.
+static int nvmpienc_send_drm_frame(AVCodecContext *avctx, const AVFrame *frame)
+{
+	nvmpiEncodeContext *nvmpi_context = avctx->priv_data;
+	const AVDRMFrameDescriptor *desc = (const AVDRMFrameDescriptor*)frame->data[0];
+	nvDmaBufFrame dbf = {0};
+	int l, p, np = 0, res;
+
+	if(frame->hw_frames_ctx)
+	{
+		AVHWFramesContext *hwf = (AVHWFramesContext*)frame->hw_frames_ctx->data;
+		if(hwf->sw_format != AV_PIX_FMT_NV12)
+		{
+			av_log(avctx, AV_LOG_ERROR, "drm_prime input must carry NV12, got %s\n",
+				av_get_pix_fmt_name(hwf->sw_format));
+			return AVERROR(EINVAL);
+		}
+	}
+	if(desc->nb_objects != 1)
+	{
+		av_log(avctx, AV_LOG_ERROR, "drm_prime frame spans %d dmabuf objects, only single-object buffers can be imported\n",
+			desc->nb_objects);
+		return AVERROR(EINVAL);
+	}
+	for(l = 0; l < desc->nb_layers; l++)
+		for(p = 0; p < desc->layers[l].nb_planes && np < 3; p++, np++)
+		{
+			dbf.pitch[np] = desc->layers[l].planes[p].pitch;
+			dbf.offset[np] = desc->layers[l].planes[p].offset;
+		}
+	if(np != 2)
+	{
+		av_log(avctx, AV_LOG_ERROR, "drm_prime frame describes %d planes, expected 2 (NV12); "
+			"the producer did not export the plane layout\n", np);
+		return AVERROR(EINVAL);
+	}
+	if(dbf.pitch[0] % 256 || dbf.pitch[1] % 256)
+	{
+		av_log(avctx, AV_LOG_ERROR, "drm_prime plane pitch %u/%u is not 256-aligned, the encoder cannot import it zero-copy; "
+			"allocate the source image with a 256-aligned row pitch (e.g. pad the width to a multiple of 256)\n",
+			dbf.pitch[0], dbf.pitch[1]);
+		return AVERROR(EINVAL);
+	}
+
+	dbf.fd = desc->objects[0].fd;
+	dbf.totalSize = desc->objects[0].size;
+	dbf.num_planes = 2;
+	dbf.width[0] = avctx->width;
+	dbf.height[0] = avctx->height;
+	dbf.width[1] = avctx->width / 2;
+	dbf.height[1] = (avctx->height + 1) / 2;
+	dbf.psize[0] = (dbf.offset[1] > dbf.offset[0]) ? dbf.offset[1] - dbf.offset[0] : dbf.pitch[0] * dbf.height[0];
+	dbf.psize[1] = (dbf.totalSize > dbf.offset[1]) ? dbf.totalSize - dbf.offset[1] : dbf.pitch[1] * dbf.height[1];
+	dbf.timestamp = av_rescale_q(frame->pts, avctx->time_base, NVENC_TIMEBASE);
+
+	res = nvmpi_encoder_put_dmabuf(nvmpi_context->ctx, &dbf);
+	if(res < 0) return AVERROR_EXTERNAL;
+
+	//hold a ref while the V4L2 buffer is in flight
+	if(nvmpi_context->held_frames[nvmpi_context->held_pos])
+		av_frame_free(&nvmpi_context->held_frames[nvmpi_context->held_pos]);
+	nvmpi_context->held_frames[nvmpi_context->held_pos] = av_frame_clone(frame);
+	nvmpi_context->held_pos = (nvmpi_context->held_pos + 1) % nvmpi_context->held_count;
+
+	return 0;
+}
+#endif
+
 static int ff_nvmpi_send_frame(AVCodecContext *avctx,const AVFrame *frame)
 {
 	nvmpiEncodeContext * nvmpi_context = avctx->priv_data;
@@ -446,6 +564,10 @@ static int ff_nvmpi_send_frame(AVCodecContext *avctx,const AVFrame *frame)
 
 	if(frame)
 	{
+#ifdef NVMPI_DRM_PRIME_INPUT
+		if(nvmpi_context->hw_input)
+			return nvmpienc_send_drm_frame(avctx, frame);
+#endif
 		_nvframe.payload[0]=frame->data[0];
 		_nvframe.payload[1]=frame->data[1];
 		_nvframe.payload[2]=frame->data[2];
@@ -568,6 +690,16 @@ static int ff_nvmpi_receive_packet_async(AVCodecContext *avctx, AVPacket *pkt)
 }
 #endif
 
+static void nvmpienc_free_held_frames(nvmpiEncodeContext *nvmpi_context)
+{
+	int i;
+	if(!nvmpi_context->held_frames) return;
+	for(i = 0; i < nvmpi_context->held_count; i++)
+		if(nvmpi_context->held_frames[i])
+			av_frame_free(&nvmpi_context->held_frames[i]);
+	av_freep(&nvmpi_context->held_frames);
+}
+
 static av_cold int nvmpi_encode_close(AVCodecContext *avctx)
 {
 	nvmpiEncodeContext *nvmpi_context = avctx->priv_data;
@@ -575,6 +707,7 @@ static av_cold int nvmpi_encode_close(AVCodecContext *avctx)
 	if(!nvmpi_context->ctx)
 	{
 		av_frame_free(&nvmpi_context->frame);
+		nvmpienc_free_held_frames(nvmpi_context);
 		return 0;
 	}
 
@@ -606,6 +739,8 @@ static av_cold int nvmpi_encode_close(AVCodecContext *avctx)
 	nvmpienc_deinitPktPool(avctx);
 	nvmpi_encoder_close(nvmpi_context->ctx);
 	av_frame_free(&nvmpi_context->frame);
+	//dmabuf refs may only be dropped once the encoder released its buffers
+	nvmpienc_free_held_frames(nvmpi_context);
 
 	return 0;
 }
@@ -717,6 +852,7 @@ static const AVOption av1_options[] = {
 			.p.pix_fmts       = PIXFMTS,\
 			.p.capabilities   = AV_CODEC_CAP_HARDWARE | AV_CODEC_CAP_DELAY, \
 			.defaults       = defaults,\
+			.hw_configs     = nvmpi_enc_hw_configs, \
 			.p.wrapper_name   = "nvmpi", \
 		};
 #else
@@ -748,10 +884,22 @@ static const AVOption av1_options[] = {
 		};
 #endif
 
+#ifdef NVMPI_DRM_PRIME_INPUT
+#define NVMPI_PIX_FMTS_8BIT (const enum AVPixelFormat[]) { AV_PIX_FMT_YUV420P, AV_PIX_FMT_DRM_PRIME, AV_PIX_FMT_NONE }
+//10-bit input is HEVC-only: the Orin encoder has no 10-bit AV1 mode (it silently
+//encodes 8-bit) and H.264 HW is 8-bit; see the format table in v4l2_nv_extensions.h
+#define NVMPI_PIX_FMTS_HEVC (const enum AVPixelFormat[]) { AV_PIX_FMT_YUV420P, AV_PIX_FMT_P010LE, AV_PIX_FMT_DRM_PRIME, AV_PIX_FMT_NONE }
+
+static const AVCodecHWConfigInternal *const nvmpi_enc_hw_configs[] = {
+	HW_CONFIG_ENCODER_FRAMES(DRM_PRIME, DRM),
+	NULL,
+};
+#else
 #define NVMPI_PIX_FMTS_8BIT (const enum AVPixelFormat[]) { AV_PIX_FMT_YUV420P, AV_PIX_FMT_NONE }
 //10-bit input is HEVC-only: the Orin encoder has no 10-bit AV1 mode (it silently
 //encodes 8-bit) and H.264 HW is 8-bit; see the format table in v4l2_nv_extensions.h
 #define NVMPI_PIX_FMTS_HEVC (const enum AVPixelFormat[]) { AV_PIX_FMT_YUV420P, AV_PIX_FMT_P010LE, AV_PIX_FMT_NONE }
+#endif
 
 NVMPI_ENC(h264, "H.264", AV_CODEC_ID_H264, options, NVMPI_PIX_FMTS_8BIT);
 NVMPI_ENC(hevc, "HEVC", AV_CODEC_ID_HEVC, options, NVMPI_PIX_FMTS_HEVC);
