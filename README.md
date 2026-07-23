@@ -119,17 +119,29 @@ last — so `-resize 1280x720 -rotate 90` produces a 720x1280 output.
 
     ffmpeg -c:v h264_nvmpi -i <input.mp4> -c:v hevc_nvmpi <output.mp4>
 
-**Zero-copy encoder input from Vulkan / DRM PRIME (ffmpeg 8+, API)**
+**Zero-copy encoder input from Vulkan / DRM PRIME (ffmpeg 8+)**
 
 The encoders accept `AV_PIX_FMT_DRM_PRIME` frames and queue the dmabuf
 directly on the V4L2 output plane. Vulkan: linear NV12 or P010 image
-(`tiling = VK_IMAGE_TILING_LINEAR` on the frames context), mapped per frame
-with `av_hwframe_map()` to drm_prime; non-ffmpeg users:
+(`tiling = VK_IMAGE_TILING_LINEAR` on the frames context), mapped with
+`av_hwframe_map()` to drm_prime; non-ffmpeg users:
 `nvmpi_encoder_put_dmabuf()`. Constraints: NV12, or P010 for hevc_nvmpi
 (HEVC Main 10); single dmabuf object, pitch-linear with 256-aligned byte
 pitch (Tegra linear pitch == width for NV12, width*2 for P010), descriptor
-must carry the plane layout. Map each Vulkan image once and reuse the mapped
-frame (every `av_hwframe_map()` exports a new fd and forces a re-import), and
-keep at least `num_capture_buffers + 2` images in the producer pool: a queued
-dmabuf is read only when the encoder blits it, so rewriting a buffer that is
-still in the V4L2 queue corrupts the stream.
+must carry the plane layout. The lib dups and caches each buffer's fd (keyed
+by dmabuf inode), so producer fds may be closed freely; the buffer memory
+must stay untouched until its V4L2 slot recycles — keep at least
+`num_capture_buffers + 2` images in the producer pool.
+
+CLI: set `NVMPI_VULKAN_LINEAR=1` (the ffpatch adds this override; in-graph
+vulkan devices cannot receive `linear_images=1` any other way) and map the
+filter output to drm_prime:
+
+    NVMPI_VULKAN_LINEAR=1 ffmpeg -init_hw_device drm=dr:/dev/dri/renderD128 \
+      -init_hw_device vulkan=vk@dr -filter_hw_device vk -framerate 25/100 -i in.png \
+      -vf "format=nv12,libplacebo=w=1280:h=720:fps=25,format=vulkan,hwmap=derive_device=drm,format=drm_prime" \
+      -c:v h264_nvmpi -b:v 4M out.mp4
+
+`format=nv12` goes BEFORE libplacebo (its `format=` option would drop the
+vulkan output); width must satisfy the pitch rule (width%256==0 for 8-bit),
+otherwise the encoder rejects the import with a clear error.

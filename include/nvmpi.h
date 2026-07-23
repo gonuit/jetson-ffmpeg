@@ -138,10 +138,11 @@ extern "C" {
 	//add frame to encoder
 	int nvmpi_encoder_put_frame(nvmpictx* ctx, nvFrame* frame);
 	//zero-copy: queue an external dmabuf as the next raw frame (requires
-	//useDmabufInput). The fd must stay valid and untouched while its V4L2
-	//buffer is in flight: the blit reads it only when the encoder reaches the
-	//buffer, so the producer pool must span the queue depth (capture_num + 2
-	//buffers). Reuse stable fds; a new fd for the same memory re-imports.
+	//useDmabufInput). The lib dups and registers the fd on first sight of
+	//each buffer (keyed by dmabuf inode), so the caller may close its fd
+	//after return. The buffer MEMORY must stay untouched while its V4L2
+	//buffer is in flight: the blit reads it only when the encoder reaches
+	//it, so the producer pool must span the queue depth (capture_num + 2).
 	//NULL flushes.
 	int nvmpi_encoder_put_dmabuf(nvmpictx* ctx, nvDmaBufFrame* frame);
 	//get filled packet from encoder

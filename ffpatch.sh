@@ -297,6 +297,23 @@ else
 	echo "[I]: hwcontext_vulkan linear-layout fallback skipped (anchor not found)"
 fi
 
+#NVMPI_VULKAN_LINEAR=1: force LINEAR tiling on all vulkan frame pools. The CLI
+#cannot pass linear_images=1 to derived/in-graph vulkan devices, and LINEAR is
+#what lets vulkan_map_to_drm export the plane layout on Tegra.
+if [ -f "$FF_FILE_HWCONTEXT_VULKAN" ] && grep -q 'p->use_linear_images &&' "$FF_FILE_HWCONTEXT_VULKAN"; then
+	sed -i 's/if (p->use_linear_images \&\&/if ((p->use_linear_images || (getenv("NVMPI_VULKAN_LINEAR") \&\& atoi(getenv("NVMPI_VULKAN_LINEAR")))) \&\&/' "$FF_FILE_HWCONTEXT_VULKAN"
+	if grep -q 'NVMPI_VULKAN_LINEAR' "$FF_FILE_HWCONTEXT_VULKAN"; then
+		echo "$FF_FILE_HWCONTEXT_VULKAN linear env override patched"
+	else
+		echo "Patching NVMPI_VULKAN_LINEAR into $FF_FILE_HWCONTEXT_VULKAN failed!"
+		exit 1
+	fi
+elif grep -q 'NVMPI_VULKAN_LINEAR' "$FF_FILE_HWCONTEXT_VULKAN" 2>/dev/null; then
+	echo "$FF_FILE_HWCONTEXT_VULKAN linear env override already patched"
+else
+	echo "[I]: NVMPI_VULKAN_LINEAR override skipped (anchor not found)"
+fi
+
 echo "Success!"
 
 rm -rf "$BKP_DIR" 2>&1 > /dev/null

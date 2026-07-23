@@ -3,6 +3,7 @@
 #include "nvUtils2NvBuf.h"
 #include "NVMPI_bufPool.hpp"
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <malloc.h>
 #include <vector>
 #include <iostream>
@@ -68,9 +69,13 @@ struct nvmpictx
 	bool dmabuf_input;
 	int lastDmabufFd;
 #ifdef WITH_NVUTILS
-	//fds registered via NvBufSurfaceImport: the V4L2 backend resolves queued
-	//fds with NvBufSurfaceFromFd, which only knows registered buffers
-	std::vector<int> importedFds;
+	//buffers registered via NvBufSurfaceImport: the V4L2 backend resolves
+	//queued fds with NvBufSurfaceFromFd, which only knows registered buffers.
+	//Keyed by dmabuf inode (unique per buffer, never recycled); fd is our own
+	//dup() — producer fd numbers get recycled by the kernel and destroying an
+	//imported surface closes its fd, so the lib must own what it registers.
+	struct nvmpiImportedBuf { ino_t ino; int fd; NvBufSurface* surf; };
+	std::vector<nvmpiImportedBuf> importedBufs;
 	NvBufSurfaceColorFormat dmabufColorFormat;
 #endif
 };
@@ -670,12 +675,19 @@ int copyFrameToNvBuf(nvFrame* frame, NvBuffer& buffer)
 }
 
 #ifdef WITH_NVUTILS
-//register a foreign dmabuf so NvBufSurfaceFromFd resolves it. libnvbufsurface
-//can crash on invalid import params, so all known constraints are checked first.
+//register a foreign dmabuf so NvBufSurfaceFromFd resolves it, and return the
+//fd to queue (a lib-owned dup of the producer fd). libnvbufsurface can crash
+//on invalid import params, so all known constraints are checked first.
 static int nvmpi_enc_register_dmabuf(nvmpictx* ctx, nvDmaBufFrame* frame)
 {
-	for(size_t i=0; i<ctx->importedFds.size(); i++)
-		if(ctx->importedFds[i] == frame->fd) return 0;
+	struct stat st;
+	if(fstat(frame->fd, &st) != 0)
+	{
+		cerr << "nvmpi: cannot fstat dmabuf fd " << frame->fd << endl;
+		return -1;
+	}
+	for(size_t i=0; i<ctx->importedBufs.size(); i++)
+		if(ctx->importedBufs[i].ino == st.st_ino) return ctx->importedBufs[i].fd;
 
 	if(frame->num_planes != 2)
 	{
@@ -697,10 +709,17 @@ static int nvmpi_enc_register_dmabuf(nvmpictx* ctx, nvDmaBufFrame* frame)
 		}
 	}
 
+	int dfd = dup(frame->fd);
+	if(dfd < 0)
+	{
+		cerr << "nvmpi: cannot dup dmabuf fd " << frame->fd << endl;
+		return -1;
+	}
+
 	NvBufSurfaceMapParams mp;
 	memset(&mp, 0, sizeof(mp));
 	mp.num_planes = frame->num_planes;
-	mp.fd = frame->fd;
+	mp.fd = dfd;
 	mp.totalSize = frame->totalSize;
 	mp.memType = NVBUF_MEM_SURFACE_ARRAY;
 	mp.layout = NVBUF_LAYOUT_PITCH;
@@ -720,10 +739,11 @@ static int nvmpi_enc_register_dmabuf(nvmpictx* ctx, nvDmaBufFrame* frame)
 	if(NvBufSurfaceImport(&surf, &mp) != 0 || !surf)
 	{
 		cerr << "nvmpi: NvBufSurfaceImport failed for dmabuf fd " << frame->fd << endl;
+		close(dfd);
 		return -1;
 	}
-	ctx->importedFds.push_back(frame->fd);
-	return 0;
+	ctx->importedBufs.push_back({st.st_ino, dfd, surf});
+	return dfd;
 }
 #endif
 
@@ -749,10 +769,13 @@ int nvmpi_encoder_put_dmabuf(nvmpictx* ctx, nvDmaBufFrame* frame)
 	if(ctx->enc->isInError())
 		return -1;
 
+	int qfd = -1;
 	if(frame)
 	{
-		//validate + import before claiming a V4L2 buffer slot
-		if(nvmpi_enc_register_dmabuf(ctx, frame) < 0) return -1;
+		//validate + import before claiming a V4L2 buffer slot; the queued fd
+		//is the lib-owned dup, so producer fd lifetime stops mattering here
+		qfd = nvmpi_enc_register_dmabuf(ctx, frame);
+		if(qfd < 0) return -1;
 	}
 	else if(ctx->lastDmabufFd < 0)
 	{
@@ -785,10 +808,10 @@ int nvmpi_encoder_put_dmabuf(nvmpictx* ctx, nvDmaBufFrame* frame)
 	{
 		for(uint32_t j = 0; j < nvBuffer->n_planes; j++)
 		{
-			v4l2_buf.m.planes[j].m.fd = frame->fd;
+			v4l2_buf.m.planes[j].m.fd = qfd;
 			v4l2_buf.m.planes[j].bytesused = frame->pitch[j] * frame->height[j];
 		}
-		ctx->lastDmabufFd = frame->fd;
+		ctx->lastDmabufFd = qfd;
 		v4l2_buf.flags |= V4L2_BUF_FLAG_TIMESTAMP_COPY;
 		v4l2_buf.timestamp.tv_usec = frame->timestamp % 1000000;
 		v4l2_buf.timestamp.tv_sec = frame->timestamp / 1000000;
@@ -1005,9 +1028,10 @@ int nvmpi_encoder_close(nvmpictx* ctx)
 	delete ctx->enc;
 	delete ctx->pktPool;
 #ifdef WITH_NVUTILS
-	//drop the references NvBufSurfaceImport added; the fds stay the producer's
-	for(size_t i=0; i<ctx->importedFds.size(); i++)
-		NvBufferDestroy(ctx->importedFds[i]);
+	//drop the wrappers NvBufSurfaceImport created; destroying by surface (not
+	//by fd) stays correct when fd numbers were recycled mid-stream
+	for(size_t i=0; i<ctx->importedBufs.size(); i++)
+		NvBufSurfaceDestroy(ctx->importedBufs[i].surf);
 #endif
 	delete ctx;
 	return 0;
