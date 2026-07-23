@@ -21,6 +21,7 @@ typedef enum {
 	NV_VIDEO_CodingVP8,                /**< VP8 */
 	NV_VIDEO_CodingVP9,                /**< VP9 */
 	NV_VIDEO_CodingHEVC,               /**< H.265/HEVC */
+	NV_VIDEO_CodingAV1,                /**< AV1 */
 } nvCodingType;
 
 typedef struct _NVSIZE{

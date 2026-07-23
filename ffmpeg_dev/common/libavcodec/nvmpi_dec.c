@@ -37,6 +37,7 @@ static nvCodingType nvmpi_get_codingtype(AVCodecContext *avctx)
 	switch (avctx->codec_id) {
 		case AV_CODEC_ID_H264:          return NV_VIDEO_CodingH264;
 		case AV_CODEC_ID_HEVC:          return NV_VIDEO_CodingHEVC;
+		case AV_CODEC_ID_AV1:           return NV_VIDEO_CodingAV1;
 		case AV_CODEC_ID_VP8:           return NV_VIDEO_CodingVP8;
 		case AV_CODEC_ID_VP9:           return NV_VIDEO_CodingVP9;
 		case AV_CODEC_ID_MPEG4:		return NV_VIDEO_CodingMPEG4;
@@ -255,4 +256,5 @@ NVMPI_DEC(mpeg2, AV_CODEC_ID_MPEG2VIDEO,NULL);
 NVMPI_DEC(mpeg4, AV_CODEC_ID_MPEG4,NULL);
 NVMPI_DEC(vp9,  AV_CODEC_ID_VP9,NULL);
 NVMPI_DEC(vp8, AV_CODEC_ID_VP8,NULL);
+NVMPI_DEC(av1, AV_CODEC_ID_AV1,NULL);
 

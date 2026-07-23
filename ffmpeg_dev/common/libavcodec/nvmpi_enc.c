@@ -139,6 +139,50 @@ int nvmpienc_deinitPktPool(AVCodecContext *avctx)
 	return 0;
 }
 
+//minimal AV1 OBU walk to locate the sequence header OBU (type 1) in a temporal unit.
+//returns the OBU start offset and stores its full length (header + size field + payload)
+//in *obu_len, or returns -1 if not found or malformed.
+static int nvmpienc_av1_find_seq_header(const uint8_t *buf, int size, int *obu_len)
+{
+	int pos = 0;
+	while(pos < size)
+	{
+		int start = pos;
+		uint8_t hdr = buf[pos++];
+		int type = (hdr >> 3) & 0xF;
+		int64_t obu_size;
+		if(hdr & 0x80) return -1; //obu_forbidden_bit
+		if(hdr & 0x4) //obu_extension_flag
+		{
+			if(pos >= size) return -1;
+			pos++;
+		}
+		if(hdr & 0x2) //obu_has_size_field
+		{
+			int shift = 0, byte;
+			obu_size = 0;
+			do {
+				if(pos >= size || shift > 56) return -1;
+				byte = buf[pos++];
+				obu_size |= (int64_t)(byte & 0x7F) << shift;
+				shift += 7;
+			} while(byte & 0x80);
+		}
+		else
+		{
+			obu_size = size - pos; //only valid for the last OBU of the temporal unit
+		}
+		if(pos + obu_size > size) return -1;
+		if(type == 1) //OBU_SEQUENCE_HEADER
+		{
+			*obu_len = (int)(pos + obu_size - start);
+			return start;
+		}
+		pos += obu_size;
+	}
+	return -1;
+}
+
 static av_cold int nvmpi_encode_init(AVCodecContext *avctx)
 {
 	nvmpiEncodeContext * nvmpi_context = avctx->priv_data;
@@ -189,8 +233,16 @@ static av_cold int nvmpi_encode_init(AVCodecContext *avctx)
 
 	}
 
+	if(avctx->codec->id == AV_CODEC_ID_AV1)
+	{
+		//AV1 has no SPS/PPS and no H.264/HEVC-style profile/level controls in the HW
+		param.profile=0;
+		param.level=0;
+		param.insert_spspps_idr=0;
+	}
+
 	//TODO should replace it. must gen extradata directly without calling for encoder
-	if ((avctx->flags & AV_CODEC_FLAG_GLOBAL_HEADER) && (avctx->codec->id == AV_CODEC_ID_H264 || avctx->codec->id == AV_CODEC_ID_H265))
+	if ((avctx->flags & AV_CODEC_FLAG_GLOBAL_HEADER) && (avctx->codec->id == AV_CODEC_ID_H264 || avctx->codec->id == AV_CODEC_ID_H265 || avctx->codec->id == AV_CODEC_ID_AV1))
 	{
 		uint8_t *dst[4];
 		int linesize[4];
@@ -201,6 +253,7 @@ static av_cold int nvmpi_encode_init(AVCodecContext *avctx)
 		int ret;
 		int64_t shiftPts = 1000000/param.fps_n;
 		if(avctx->codec->id == AV_CODEC_ID_H264) param.codingType = NV_VIDEO_CodingH264;
+		else if(avctx->codec->id == AV_CODEC_ID_AV1) param.codingType = NV_VIDEO_CodingAV1;
 		else param.codingType = NV_VIDEO_CodingHEVC;
 		av_image_alloc(dst, linesize,avctx->width,avctx->height,avctx->pix_fmt,1);
 
@@ -231,6 +284,25 @@ static av_cold int nvmpi_encode_init(AVCodecContext *avctx)
 			if(ret<0)
 				continue;
 
+			if(param.codingType == NV_VIDEO_CodingAV1)
+			{
+				//AV1 extradata is the sequence header OBU from the first temporal unit
+				int obu_len = 0;
+				int obu_off = nvmpienc_av1_find_seq_header(nPkt->payload, nPkt->payload_size, &obu_len);
+				if(obu_off < 0)
+				{
+					av_log(avctx, AV_LOG_WARNING, "no AV1 sequence header OBU in first encoded packet, extradata not set\n");
+				}
+				else
+				{
+					avctx->extradata_size = obu_len;
+					avctx->extradata	= av_mallocz( avctx->extradata_size + AV_INPUT_BUFFER_PADDING_SIZE );
+					memcpy( avctx->extradata, nPkt->payload+obu_off, avctx->extradata_size);
+					memset( avctx->extradata + avctx->extradata_size, 0, AV_INPUT_BUFFER_PADDING_SIZE );
+				}
+			}
+			else
+			{
 			//find idr index
 			while(i<nPkt->payload_size)
 			{
@@ -255,6 +327,7 @@ static av_cold int nvmpi_encode_init(AVCodecContext *avctx)
 			avctx->extradata	= av_mallocz( avctx->extradata_size + AV_INPUT_BUFFER_PADDING_SIZE );
 			memcpy( avctx->extradata, nPkt->payload,avctx->extradata_size);
 			memset( avctx->extradata + avctx->extradata_size, 0, AV_INPUT_BUFFER_PADDING_SIZE );
+			}
 			
 			nvmpienc_nvPacket_free(nPkt);
 			nPkt = nvmpienc_nvPacket_alloc(avctx, NVMPI_ENC_CHUNK_SIZE);
@@ -296,6 +369,11 @@ static av_cold int nvmpi_encode_init(AVCodecContext *avctx)
 	else if(avctx->codec->id == AV_CODEC_ID_HEVC)
 	{
 		param.codingType = NV_VIDEO_CodingHEVC;
+		nvmpi_context->ctx=nvmpi_create_encoder(&param);
+	}
+	else if(avctx->codec->id == AV_CODEC_ID_AV1)
+	{
+		param.codingType = NV_VIDEO_CodingAV1;
 		nvmpi_context->ctx=nvmpi_create_encoder(&param);
 	}
 	//else TODO
@@ -541,19 +619,37 @@ static const AVOption options[] = {
 	{ NULL }
 };
 
+//AV1 has no H.264/HEVC-style profile/level controls in the HW encoder
+static const AVOption av1_options[] = {
+	{ "num_capture_buffers", "Number of buffers in the capture context", OFFSET(num_capture_buffers), AV_OPT_TYPE_INT, {.i64 = 10 }, 1, 32, VE, "num_capture_buffers" },
+	{ "packet_pool_size", "Number of packets that could be buffered in the encoder before user must read it with avcodec_receive_packet()", OFFSET(packet_pool_size), AV_OPT_TYPE_INT, {.i64 = OPT_packet_pool_size_DEFAULT }, OPT_packet_pool_size_MIN, OPT_packet_pool_size_MAX, VE, "packet_pool_size" },
 
-#define NVMPI_ENC_CLASS(NAME) \
+	{ "rc",           "Override the preset rate-control",   OFFSET(rc),           AV_OPT_TYPE_INT,   { .i64 = -1 },                                  -1, INT_MAX, VE, "rc" },
+	{ "cbr",          "Constant bitrate mode",              0,                    AV_OPT_TYPE_CONST, { .i64 = 0 },                       0, 0, VE, "rc" },
+	{ "vbr",          "Variable bitrate mode",              0,                    AV_OPT_TYPE_CONST, { .i64 = 1 },                       0, 0, VE, "rc" },
+
+	{ "preset",          "Set the encoding preset",            OFFSET(preset),       AV_OPT_TYPE_INT,   { .i64 = 3 }, 1, 4, VE, "preset" },
+	{ "default",         "",                                   0,                    AV_OPT_TYPE_CONST, { .i64 = 3 }, 0, 0, VE, "preset" },
+	{ "slow",            "",                        0,                    AV_OPT_TYPE_CONST, { .i64 = 4 },            0, 0, VE, "preset" },
+	{ "medium",          "",                        0,                    AV_OPT_TYPE_CONST, { .i64 = 3 },            0, 0, VE, "preset" },
+	{ "fast",            "",                        0,                    AV_OPT_TYPE_CONST, { .i64 = 2 },            0, 0, VE, "preset" },
+	{ "ultrafast",       "",                        0,                    AV_OPT_TYPE_CONST, { .i64 = 1 },            0, 0, VE, "preset" },
+	{ NULL }
+};
+
+
+#define NVMPI_ENC_CLASS(NAME, OPTS) \
 	static const AVClass nvmpi_ ## NAME ## _enc_class = { \
 		.class_name = #NAME "_nvmpi_encoder", \
 		.item_name  = av_default_item_name, \
-		.option     = options, \
+		.option     = OPTS, \
 		.version    = LIBAVUTIL_VERSION_INT, \
 	};
 
 
 #if LIBAVCODEC_VERSION_MAJOR >= 60
-	#define NVMPI_ENC(NAME, LONGNAME, CODEC) \
-		NVMPI_ENC_CLASS(NAME) \
+	#define NVMPI_ENC(NAME, LONGNAME, CODEC, OPTS) \
+		NVMPI_ENC_CLASS(NAME, OPTS) \
 		FFCodec ff_ ## NAME ## _nvmpi_encoder = { \
 			.p.name           = #NAME "_nvmpi" , \
 			CODEC_LONG_NAME("nvmpi " LONGNAME " encoder wrapper"), \
@@ -579,8 +675,8 @@ static const AVOption options[] = {
 				.receive_packet = ff_nvmpi_receive_packet
 	#endif
 	
-	#define NVMPI_ENC(NAME, LONGNAME, CODEC) \
-		NVMPI_ENC_CLASS(NAME) \
+	#define NVMPI_ENC(NAME, LONGNAME, CODEC, OPTS) \
+		NVMPI_ENC_CLASS(NAME, OPTS) \
 		AVCodec ff_ ## NAME ## _nvmpi_encoder = { \
 			.name           = #NAME "_nvmpi" , \
 			.long_name      = NULL_IF_CONFIG_SMALL("nvmpi " LONGNAME " encoder wrapper"), \
@@ -598,5 +694,6 @@ static const AVOption options[] = {
 		};
 #endif
 
-NVMPI_ENC(h264, "H.264", AV_CODEC_ID_H264);
-NVMPI_ENC(hevc, "HEVC", AV_CODEC_ID_HEVC);
+NVMPI_ENC(h264, "H.264", AV_CODEC_ID_H264, options);
+NVMPI_ENC(hevc, "HEVC", AV_CODEC_ID_HEVC, options);
+NVMPI_ENC(av1, "AV1", AV_CODEC_ID_AV1, av1_options);

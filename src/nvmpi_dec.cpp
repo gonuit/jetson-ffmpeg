@@ -576,6 +576,11 @@ nvmpictx* nvmpi_create_decoder(nvDecParam* param)
 		case NV_VIDEO_CodingVP9:
 			ctx->decoder_pixfmt=V4L2_PIX_FMT_VP9;
 			break;
+#ifdef V4L2_PIX_FMT_AV1
+		case NV_VIDEO_CodingAV1:
+			ctx->decoder_pixfmt=V4L2_PIX_FMT_AV1;
+			break;
+#endif
 		default:
 			ctx->decoder_pixfmt=V4L2_PIX_FMT_H264;
 			break;

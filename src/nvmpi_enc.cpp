@@ -326,6 +326,12 @@ nvmpictx* nvmpi_create_encoder(nvEncParam* param)
 	{
 		ctx->encoder_pixfmt=V4L2_PIX_FMT_H265;
 	}
+#ifdef V4L2_PIX_FMT_AV1
+	else if(param->codingType==NV_VIDEO_CodingAV1)
+	{
+		ctx->encoder_pixfmt=V4L2_PIX_FMT_AV1;
+	}
+#endif
 	if(ctx->blocking_mode)
 	{
 		ctx->enc=NvVideoEncoder::createVideoEncoder("enc0");
@@ -339,6 +345,27 @@ nvmpictx* nvmpi_create_encoder(nvEncParam* param)
 	ret = ctx->enc->setCapturePlaneFormat(ctx->encoder_pixfmt, ctx->width,ctx->height, NVMPI_ENC_CHUNK_SIZE);
 
 	TEST_ERROR(ret < 0, "Could not set output plane format", ret);
+
+#ifdef V4L2_CID_MPEG_VIDEOENC_AV1_HEADERS_WITH_FRAME
+	if(param->codingType==NV_VIDEO_CodingAV1)
+	{
+		//the HW emits IVF-wrapped output by default; disable it to get raw OBUs.
+		//gst nvv4l2av1enc (enable-headers=false) sets this control right after the
+		//capture plane S_FMT, before the output plane format — same order here.
+		//NvVideoEncoder has no wrapper method for this control, so set it directly.
+		struct v4l2_ext_control ectrl;
+		struct v4l2_ext_controls ectrls;
+		memset(&ectrl, 0, sizeof(ectrl));
+		memset(&ectrls, 0, sizeof(ectrls));
+		ectrls.count = 1;
+		ectrls.controls = &ectrl;
+		ectrls.ctrl_class = V4L2_CTRL_CLASS_MPEG;
+		ectrl.id = V4L2_CID_MPEG_VIDEOENC_AV1_HEADERS_WITH_FRAME;
+		ectrl.value = 0;
+		ret = ctx->enc->setExtControls(ectrls);
+		TEST_ERROR(ret < 0, "Could not disable AV1 IVF headers", ret);
+	}
+#endif
 
 	switch (ctx->profile)
 	{
@@ -442,10 +469,21 @@ nvmpictx* nvmpi_create_encoder(nvEncParam* param)
 		TEST_ERROR(ret < 0, "Error while setting encoder to max perf", ret);
 	}
 	
-	if(ctx->insert_sps_pps_at_idr){
+	//SPS/PPS insertion is an H.264/HEVC concept, do not apply it to other codecs
+	if(ctx->insert_sps_pps_at_idr &&
+	   (param->codingType==NV_VIDEO_CodingH264 || param->codingType==NV_VIDEO_CodingHEVC)){
 		ret = ctx->enc->setInsertSpsPpsAtIdrEnabled(true);
 		TEST_ERROR(ret < 0, "Could not set insertSPSPPSAtIDR", ret);
 	}
+
+#ifdef V4L2_CID_MPEG_VIDEOENC_AV1_ERR_RESILIENT_MODE
+	if(param->codingType==NV_VIDEO_CodingAV1)
+	{
+		//the only AV1 control 01_video_encode always sets (default true)
+		ret = ctx->enc->setAV1ErrResilienceMode(true);
+		TEST_ERROR(ret < 0, "Could not set AV1 error resilience mode", ret);
+	}
+#endif
 
 	ret = ctx->enc->setFrameRate(ctx->fps_n, ctx->fps_d);
 	TEST_ERROR(ret < 0, "Could not set framerate", ret);
